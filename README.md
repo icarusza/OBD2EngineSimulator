@@ -73,6 +73,58 @@ This allows the PC application to change simulated engine operating conditions w
 
 ## Future Development
 
+
+## Windows Forms Application
+
+The project includes a C# Windows Forms application developed in Visual Studio.
+
+The application communicates with the Arduino UNO over USB serial and provides a graphical interface for controlling the simulated ECU parameters.
+
+### Features
+
+- Automatic COM port detection and refresh.
+- USB serial connection and disconnection.
+- Configurable serial baud rate.
+- CAN protocol selection.
+- Individual ECU parameter controls using sliders and numeric inputs.
+- Live parameter updates sent to the Arduino.
+- Driving simulation with different tuning modes.
+- Simulated engine RPM, MAP, fuel trims, AFR, throttle position, vehicle speed, engine load, MAF and ignition timing.
+- Live serial communication log.
+- Lambda display for commanded and measured AFR.
+
+### Project Structure
+
+- `OBD2EngineSimulator.slnx` – Visual Studio solution.
+- `OBD2EngineSimulator/OBD2EngineSimulator.csproj` – C# project file.
+- `OBD2EngineSimulator/Form1.cs` – Main application code and interface logic.
+- `OBD2EngineSimulator/Form1.Designer.cs` – Windows Forms designer file.
+- `OBD2EngineSimulator/Form1.resx` – Form resources.
+- `OBD2EngineSimulator/Program.cs` – Application entry point.
+
+### Serial Communication
+
+The application sends engine parameter updates to the Arduino using simple text commands over USB serial.
+
+Example:
+
+```text
+RPM:850
+MAP:85
+STFT:3.1
+LTFT:-2.3
+AFR:14.7
+MEASURED_AFR:14.7
+ECT:90
+IAT:25
+TPS:10
+SPEED:60
+LOAD:35
+MAF:12.5
+TIMING:18
+```
+
+The Arduino firmware receives these commands and updates the simulated ECU values.
 - Additional standard OBD-II PID support.
 - Expanded engine simulation parameters.
 - Additional diagnostic functionality.
