@@ -10,3 +10,70 @@ J2534 Pass-Thru integration is a potential future development.
 <img width="1195" height="896" alt="UNO2" src="https://github.com/user-attachments/assets/b6897a9f-c7d8-421a-967e-31e9032de84b" />
 <img width="896" height="1195" alt="UNO" src="https://github.com/user-attachments/assets/b329b943-22cb-433b-b981-d717059fea61" />
 <img width="1072" height="833" alt="image" src="https://github.com/user-attachments/assets/4804e5e3-0da0-4f91-bc44-ab0bb5e22622" />
+## Supported OBD-II PIDs
+
+The simulator currently implements a selection of standard OBD-II Mode 01 diagnostic PIDs.
+
+| PID | Parameter | Description |
+|---|---|---|
+| 04 | Engine Load | Calculated engine load |
+| 05 | Coolant Temperature | Engine coolant temperature |
+| 06 | Short Term Fuel Trim | STFT |
+| 07 | Long Term Fuel Trim | LTFT |
+| 0B | Manifold Pressure | MAP |
+| 0C | Engine RPM | Engine speed |
+| 0D | Vehicle Speed | Vehicle speed |
+| 0E | Ignition Timing | Ignition advance |
+| 0F | Intake Temperature | Intake air temperature |
+| 10 | Mass Air Flow | MAF |
+| 11 | Throttle Position | Throttle position |
+| 13 | Oxygen Sensor Locations | Sensor availability |
+| 24 | Wide-range Oxygen Sensor | Lambda and sensor voltage |
+| 44 | Commanded Equivalence Ratio | Commanded equivalence ratio |
+
+### PID Support Information
+
+The simulator responds to the following PID availability requests:
+
+- PID 00: Supported PIDs 01–20
+- PID 20: Supported PIDs 21–40
+- PID 40: Supported PIDs 41–60
+
+These responses allow diagnostic software to identify which PIDs the simulator advertises.
+
+## Extending the Simulator
+
+The Arduino firmware is designed to allow additional PID responses to be implemented.
+
+PID processing is handled inside the `ProcessOBDRequest()` function using a C++ switch statement.
+
+Developers can extend the simulator by:
+
+1. Adding a new PID case to `ProcessOBDRequest()`.
+2. Reading or calculating the required engine parameter.
+3. Converting the value into the appropriate OBD-II response format.
+4. Setting the correct response data length.
+5. Updating the supported PID bitmap so diagnostic software can discover the new PID.
+
+The existing `SendOBDResponse()` function handles CAN response transmission, meaning additional PIDs can reuse the existing communication infrastructure.
+
+Developers should consult the relevant OBD-II PID definitions for the correct response formulas, scaling and data formats.
+
+## Serial Engine Parameter Control
+
+The C# Windows Forms application communicates with the Arduino UNO over USB serial at 115200 baud.
+
+The firmware accepts parameter commands in the following format:
+
+`PARAMETER:VALUE`
+
+Available parameters include RPM, MAP, STFT, LTFT, AFR, MEASURED_AFR, ECT, IAT, TPS, SPEED, LOAD, MAF and TIMING.
+
+This allows the PC application to change simulated engine operating conditions while diagnostic equipment independently requests OBD-II data over CAN.
+
+## Future Development
+
+- Additional standard OBD-II PID support.
+- Expanded engine simulation parameters.
+- Additional diagnostic functionality.
+- J2534 Pass-Thru integration and compatibility testing.
