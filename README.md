@@ -8,12 +8,6 @@ Includes a C# Windows Forms application communicating with the Arduino over USB 
 
 J2534 Pass-Thru integration is a potential future development.
 
-![UNO2](replace-with-permanent-GitHub-image-link)
-
-![UNO](replace-with-permanent-GitHub-image-link)
-
-![Application](replace-with-permanent-GitHub-image-link)
-
 ## Supported OBD-II PIDs
 
 The simulator currently implements 14 standard OBD-II Mode 01 data PIDs.
