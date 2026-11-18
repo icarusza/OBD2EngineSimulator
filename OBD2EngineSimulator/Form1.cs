@@ -1,57 +1,56 @@
-
-using System;
-using System.Drawing;
-using System.IO.Ports;
-using System.Windows.Forms;
-using System.Collections.Generic;
-using System.Globalization;
-using System.Linq;
+﻿using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
+using System.Globalization;
+using System.IO.Ports;
+using System.Linq;
+using System.Text.RegularExpressions;
+using System.Windows.Forms;
 
 namespace OBD2EngineSimulator
 {
     public partial class Form1 : Form
     {
-        private SerialPort serialPort;
+        private readonly ArduinoLink link = new ArduinoLink();
+        private readonly EngineModel engineModel = new EngineModel();
 
-        private System.Windows.Forms.Timer startupTimer;
-        private System.Windows.Forms.Timer sendQueueTimer;
         private System.Windows.Forms.Timer simulationTimer;
         private System.Windows.Forms.Timer logFlushTimer;
 
         private readonly Stopwatch simulationStopwatch = new Stopwatch();
 
-        private readonly Queue<string> pendingParameterOrder =
-            new Queue<string>();
-
-        private readonly HashSet<string> queuedParameters =
-            new HashSet<string>();
-
-        private readonly Dictionary<string, string> pendingParameterCommands =
-            new Dictionary<string, string>();
-
-        private readonly ConcurrentQueue<string> incomingLogMessages =
+        private readonly ConcurrentQueue<string> logQueue =
             new ConcurrentQueue<string>();
 
         private const int MaximumLogLines = 500;
 
-        private ComboBox cmbPorts;
-        private ComboBox cmbBaud;
-        private ComboBox cmbProtocol;
-        private ComboBox cmbPID;
-        private ComboBox cmbTuneMode;
+        private ComboBox cmbPorts = null!;
+        private ComboBox cmbBaud = null!;
+        private ComboBox cmbProtocol = null!;
+        private ComboBox cmbPID = null!;
+        private ComboBox cmbTuneMode = null!;
+        private ComboBox cmbLogLevel = null!;
 
-        private Button btnRefresh;
-        private Button btnConnect;
-        private Button btnSimulate;
+        private Button btnRefresh = null!;
+        private Button btnConnect = null!;
+        private Button btnSimulate = null!;
 
-        private Label lblStatus;
-        private Label lblConnection;
-        private Label lblSimulation;
+        private Label lblStatus = null!;
+        private Label lblConnection = null!;
+        private Label lblHealth = null!;
+        private Label lblSimulation = null!;
 
-        private TabControl tabParameters;
-        private TextBox txtLog;
+        private CheckBox chkIgnition = null!;
+        private CheckBox chkTraffic = null!;
+        private CheckBox chkLinkDependent = null!;
+        private CheckBox chkAutoDtc = null!;
+
+        private TabControl tabParameters = null!;
+        private TextBox txtLog = null!;
+
+        private readonly ToolTip toolTip = new ToolTip();
 
         private readonly Dictionary<string, NumericUpDown> numericControls =
             new Dictionary<string, NumericUpDown>();
@@ -65,12 +64,65 @@ namespace OBD2EngineSimulator
         private readonly Dictionary<string, Label> lambdaDisplays =
             new Dictionary<string, Label>();
 
+        private readonly Dictionary<string, Label> statusLabels =
+            new Dictionary<string, Label>();
+
         private readonly Dictionary<string, ParameterInfo> parameters =
-            new Dictionary<string, ParameterInfo>();
+            ParameterDefinitions.All.ToDictionary(p => p.Key);
+
+        // Diagnostics tab
+        private static readonly string[] DtcKeys = { "DTC_S", "DTC_P", "DTC_X" };
+        private static readonly string[] DtcListNames = { "Stored (confirmed)", "Pending", "Permanent" };
+        private const int MaximumDtcsPerList = 8;
+
+        private const string DefaultVin = "1M8GDM9AXKP042788";
+        private const string DefaultCalibrationId = "OBDSIM-CAL-0001";
+        private const string DefaultEcuName = "ECM-EngineControl";
+        private const string DefaultEsn = "OBDSIM-ENG-00001";
+
+        // Lifecycle view and fault injection (Diagnostics tab).
+        private ListView lvDtcStatus = null!;
+        private TextBox txtFaultCode = null!;
+        private ComboBox cmbFaultSeverity = null!;
+        private Label lblCycle = null!;
+
+        // Vehicle & ECU tab.
+        private TextBox txtEsn = null!;
+        private Label lblOdometer = null!;
+        private NumericUpDown numOdometer = null!;
+        private CheckBox chkTcm = null!;
+        private NumericUpDown numResponseDelay = null!;
+        private Label lblEcuSettingsStatus = null!;
+
+        // Fault states reported to the firmware (FAULT command): code -> 0/1/2.
+        // Active faults are re-sent every 2 s so a lost command cannot leave
+        // the firmware with a stale state.
+        private readonly Dictionary<string, int> faultStates = new Dictionary<string, int>();
+        private readonly HashSet<string> simulationFaults = new HashSet<string>();
+        private int faultResendTicks = 0;
+
+        private readonly List<string>[] dtcCodes =
+        {
+            new List<string>(), new List<string>(), new List<string>()
+        };
+
+        private readonly ListBox[] dtcListBoxes = new ListBox[3];
+        private TextBox txtDtcCode = null!;
+        private ComboBox cmbDtcType = null!;
+        private Label lblMil = null!;
+        private Label lblFreezeFrame = null!;
+        private Label lblDtcStatus = null!;
+        private TextBox txtVin = null!;
+        private TextBox txtCalId = null!;
+        private TextBox txtEcuName = null!;
+        private Label lblIdentityStatus = null!;
+
+        // Values reported by the Arduino (INFO / DTC? replies).
+        private bool canInitOk = true;
+        private string firmwareVersion = "";
 
         private bool updatingControls = false;
         private bool simulationRunning = false;
-        private double simulationTime = 0;
 
         // =====================================
         // CAN PROTOCOL INFORMATION
@@ -78,11 +130,12 @@ namespace OBD2EngineSimulator
 
         public class CanProtocolOption
         {
-            public string Name { get; set; }
+            public string Name { get; set; } = "";
+            public int Mode { get; set; }
             public int Bitrate { get; set; }
             public bool Extended { get; set; }
-            public string RequestID { get; set; }
-            public string ResponseID { get; set; }
+            public string RequestID { get; set; } = "";
+            public string ResponseID { get; set; } = "";
 
             public override string ToString()
             {
@@ -90,94 +143,47 @@ namespace OBD2EngineSimulator
             }
         }
 
-        private CanProtocolOption SelectedProtocol
+        private static readonly CanProtocolOption[] CanProtocols =
+        {
+            new CanProtocolOption
+            {
+                Name = "ISO 15765-4 CAN - 11-bit - 500 kbit/s",
+                Mode = 6, Bitrate = 500, Extended = false,
+                RequestID = "7DF / 7E0", ResponseID = "7E8"
+            },
+            new CanProtocolOption
+            {
+                Name = "ISO 15765-4 CAN - 11-bit - 250 kbit/s",
+                Mode = 8, Bitrate = 250, Extended = false,
+                RequestID = "7DF / 7E0", ResponseID = "7E8"
+            },
+            new CanProtocolOption
+            {
+                Name = "ISO 15765-4 CAN - 29-bit - 500 kbit/s",
+                Mode = 7, Bitrate = 500, Extended = true,
+                RequestID = "18DB33F1 / 18DA10F1", ResponseID = "18DAF110"
+            },
+            new CanProtocolOption
+            {
+                Name = "ISO 15765-4 CAN - 29-bit - 250 kbit/s",
+                Mode = 9, Bitrate = 250, Extended = true,
+                RequestID = "18DB33F1 / 18DA10F1", ResponseID = "18DAF110"
+            }
+        };
+
+        private CanProtocolOption? SelectedProtocol
         {
             get { return cmbProtocol.SelectedItem as CanProtocolOption; }
         }
 
-        // =====================================
-        // PARAMETER INFORMATION
-        // =====================================
-
-        private class ParameterInfo
+        private static string DescribeCanMode(string? mode)
         {
-            public string Name;
-            public string Command;
-            public string PID;
-            public string Unit;
-            public decimal Minimum;
-            public decimal Maximum;
-            public decimal DefaultValue;
-            public int DecimalPlaces;
-            public int Scale;
-        }
+            CanProtocolOption? option = CanProtocols.FirstOrDefault(
+                p => p.Mode.ToString(CultureInfo.InvariantCulture) == mode);
 
-        private void SetupParameters()
-        {
-            AddParameter("RPM", "Engine RPM", "RPM", "0C",
-                "RPM", 0, 12000, 850, 0, 1);
-
-            AddParameter("MAP", "Manifold Absolute Pressure", "MAP", "0B",
-                "kPa", 0, 170, 85, 0, 1);
-
-            AddParameter("STFT", "Short-Term Fuel Trim - Bank 1", "STFT", "06",
-                "%", -100, 99.2m, 3.1m, 1, 10);
-
-            AddParameter("LTFT", "Long-Term Fuel Trim - Bank 1", "LTFT", "07",
-                "%", -100, 99.2m, -2.3m, 1, 10);
-
-            AddParameter("AFR", "Commanded / Target AFR", "AFR", "44",
-                "AFR", 8, 20, 14.7m, 1, 10);
-
-            AddParameter("MEASURED_AFR", "Simulated / Measured AFR",
-                "MEASURED_AFR", "--", "AFR", 8, 20, 14.7m, 1, 10);
-
-            AddParameter("ECT", "Engine Coolant Temperature", "ECT", "05",
-                "�C", -40, 215, 90, 0, 1);
-
-            AddParameter("IAT", "Intake Air Temperature", "IAT", "0F",
-                "�C", -40, 215, 25, 0, 1);
-
-            AddParameter("TPS", "Throttle Position", "TPS", "11",
-                "%", 0, 100, 0, 1, 1);
-
-            AddParameter("SPEED", "Vehicle Speed", "SPEED", "0D",
-                "km/h", 0, 255, 0, 0, 1);
-
-            AddParameter("LOAD", "Calculated Engine Load", "LOAD", "04",
-                "%", 0, 100, 20, 1, 1);
-
-            AddParameter("MAF", "Mass Air Flow", "MAF", "10",
-                "g/s", 0, 254, 3.5m, 1, 10);
-
-            AddParameter("TIMING", "Ignition Timing Advance", "TIMING", "0E",
-                "�", -64, 63.5m, 10, 1, 10);
-        }
-
-        private void AddParameter(
-            string key,
-            string name,
-            string command,
-            string pid,
-            string unit,
-            decimal min,
-            decimal max,
-            decimal defaultValue,
-            int decimals,
-            int scale)
-        {
-            parameters[key] = new ParameterInfo
-            {
-                Name = name,
-                Command = command,
-                PID = pid,
-                Unit = unit,
-                Minimum = min,
-                Maximum = max,
-                DefaultValue = defaultValue,
-                DecimalPlaces = decimals,
-                Scale = scale
-            };
+            return option == null
+                ? "mode " + mode
+                : (option.Extended ? "29-bit " : "11-bit ") + option.Bitrate + " kbit/s";
         }
 
         // =====================================
@@ -188,17 +194,15 @@ namespace OBD2EngineSimulator
         {
             InitializeComponent();
 
-            SetupParameters();
+            RegisterLinkItems();
             BuildInterface();
             RefreshPorts();
 
-            startupTimer = new System.Windows.Forms.Timer();
-            startupTimer.Interval = 2000;
-            startupTimer.Tick += StartupTimer_Tick;
-
-            sendQueueTimer = new System.Windows.Forms.Timer();
-            sendQueueTimer.Interval = 100;
-            sendQueueTimer.Tick += SendQueueTimer_Tick;
+            link.LogMessage += Link_LogMessage;
+            link.ItemChanged += Link_ItemChanged;
+            link.ItemAdopted += Link_ItemAdopted;
+            link.DeviceStatus += Link_DeviceStatus;
+            link.ConnectionLost += Link_ConnectionLost;
 
             simulationTimer = new System.Windows.Forms.Timer();
             simulationTimer.Interval = 33;
@@ -208,6 +212,40 @@ namespace OBD2EngineSimulator
             logFlushTimer.Interval = 100;
             logFlushTimer.Tick += LogFlushTimer_Tick;
             logFlushTimer.Start();
+
+            RefreshAllStatus();
+        }
+
+        // Every value and setting the Arduino must confirm. Lines are built in
+        // this order: settings first (CAN mode, ignition), then engine values,
+        // then DTC lists, so a freeze frame captured by a new stored DTC
+        // contains the current engine values rather than older ones.
+        private void RegisterLinkItems()
+        {
+            link.RegisterItem("CAN", false, 0, false, CanProtocols[0].Mode.ToString(CultureInfo.InvariantCulture));
+            link.RegisterItem("IGN", false, 0, false, "1");
+            link.RegisterItem("LOG", false, 0, false, "1");
+            link.RegisterItem("RESPDELAY", false, 0, false, "0");
+
+            // Stored in the Arduino's EEPROM: read on connect, sent only when edited.
+            link.RegisterItem("TCM", false, 0, true, "1");
+            link.RegisterItem("VIN", false, 0, true, DefaultVin);
+            link.RegisterItem("CALID", false, 0, true, DefaultCalibrationId);
+            link.RegisterItem("ECUNAME", false, 0, true, DefaultEcuName);
+            link.RegisterItem("ESN", false, 0, true, DefaultEsn);
+
+            foreach (ParameterInfo info in ParameterDefinitions.All)
+            {
+                link.RegisterItem(
+                    info.Key,
+                    true,
+                    info.Tolerance,
+                    false,
+                    info.DefaultValue.ToString(CultureInfo.InvariantCulture));
+            }
+
+            foreach (string key in DtcKeys)
+                link.RegisterItem(key, false, 0, true, "");
         }
 
         // =====================================
@@ -217,8 +255,8 @@ namespace OBD2EngineSimulator
         private void BuildInterface()
         {
             Text = "OBD-II ECU Simulator";
-            Size = new Size(1100, 850);
-            MinimumSize = new Size(850, 650);
+            Size = new Size(1100, 900);
+            MinimumSize = new Size(900, 700);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.FromArgb(240, 243, 247);
             Font = new Font("Segoe UI", 9);
@@ -230,7 +268,7 @@ namespace OBD2EngineSimulator
             main.Padding = new Padding(12);
 
             main.RowStyles.Add(new RowStyle(SizeType.Absolute, 65));
-            main.RowStyles.Add(new RowStyle(SizeType.Absolute, 125));
+            main.RowStyles.Add(new RowStyle(SizeType.Absolute, 140));
             main.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             main.RowStyles.Add(new RowStyle(SizeType.Absolute, 155));
 
@@ -250,16 +288,17 @@ namespace OBD2EngineSimulator
             TableLayoutPanel connection = new TableLayoutPanel();
             connection.Dock = DockStyle.Fill;
             connection.ColumnCount = 4;
-            connection.RowCount = 2;
-            connection.Padding = new Padding(8);
+            connection.RowCount = 3;
+            connection.Padding = new Padding(8, 4, 8, 4);
             connection.BackColor = Color.White;
 
             for (int i = 0; i < 4; i++)
                 connection.ColumnStyles.Add(
                     new ColumnStyle(SizeType.Percent, 25));
 
-            connection.RowStyles.Add(new RowStyle(SizeType.Percent, 65));
-            connection.RowStyles.Add(new RowStyle(SizeType.Percent, 35));
+            connection.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
+            connection.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+            connection.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
 
             main.Controls.Add(connection, 0, 1);
 
@@ -279,44 +318,8 @@ namespace OBD2EngineSimulator
             cmbProtocol = new ComboBox();
             cmbProtocol.Dock = DockStyle.Fill;
             cmbProtocol.DropDownStyle = ComboBoxStyle.DropDownList;
-
-            cmbProtocol.Items.AddRange(new object[]
-            {
-                new CanProtocolOption
-                {
-                    Name = "ISO 15765-4 CAN - 11-bit - 500 kbit/s",
-                    Bitrate = 500,
-                    Extended = false,
-                    RequestID = "7DF",
-                    ResponseID = "7E8"
-                },
-                new CanProtocolOption
-                {
-                    Name = "ISO 15765-4 CAN - 11-bit - 250 kbit/s",
-                    Bitrate = 250,
-                    Extended = false,
-                    RequestID = "7DF",
-                    ResponseID = "7E8"
-                },
-                new CanProtocolOption
-                {
-                    Name = "ISO 15765-4 CAN - 29-bit - 500 kbit/s",
-                    Bitrate = 500,
-                    Extended = true,
-                    RequestID = "18DB33F1",
-                    ResponseID = "18DAF110"
-                },
-                new CanProtocolOption
-                {
-                    Name = "ISO 15765-4 CAN - 29-bit - 250 kbit/s",
-                    Bitrate = 250,
-                    Extended = true,
-                    RequestID = "18DB33F1",
-                    ResponseID = "18DAF110"
-                }
-            });
-
-            cmbProtocol.SelectedIndex = 2;
+            cmbProtocol.Items.AddRange(CanProtocols);
+            cmbProtocol.SelectedIndex = 0;
 
             btnRefresh = new Button();
             btnRefresh.Text = "Refresh COM";
@@ -347,12 +350,71 @@ namespace OBD2EngineSimulator
             connection.Controls.Add(btnConnect, 1, 1);
 
             lblConnection = new Label();
-            lblConnection.Text = "USB SERIAL";
+            lblConnection.Text = "Active CAN: not connected";
             lblConnection.Dock = DockStyle.Fill;
             lblConnection.TextAlign = ContentAlignment.MiddleLeft;
             lblConnection.ForeColor = Color.DimGray;
 
             connection.Controls.Add(lblConnection, 2, 1);
+
+            chkIgnition = new CheckBox();
+            chkIgnition.Text = "IGNITION ON";
+            chkIgnition.Checked = true;
+            chkIgnition.Dock = DockStyle.Fill;
+            chkIgnition.Font = new Font("Segoe UI", 9, FontStyle.Bold);
+            chkIgnition.CheckedChanged += ChkIgnition_CheckedChanged;
+            toolTip.SetToolTip(chkIgnition,
+                "When off, the simulated ECU does not answer any CAN request.");
+
+            connection.Controls.Add(chkIgnition, 3, 1);
+
+            FlowLayoutPanel logLevelPanel = new FlowLayoutPanel();
+            logLevelPanel.Dock = DockStyle.Fill;
+            logLevelPanel.WrapContents = false;
+            logLevelPanel.Margin = new Padding(0);
+
+            Label logLevelLabel = new Label();
+            logLevelLabel.Text = "ARDUINO LOG:";
+            logLevelLabel.AutoSize = true;
+            logLevelLabel.Font = new Font("Segoe UI", 8, FontStyle.Bold);
+            logLevelLabel.ForeColor = Color.Gray;
+            logLevelLabel.Margin = new Padding(3, 8, 3, 0);
+
+            cmbLogLevel = new ComboBox();
+            cmbLogLevel.DropDownStyle = ComboBoxStyle.DropDownList;
+            cmbLogLevel.Width = 150;
+            cmbLogLevel.Items.AddRange(new object[]
+            {
+                "0 - Errors only",
+                "1 - OBD requests",
+                "2 - Every CAN frame"
+            });
+            cmbLogLevel.SelectedIndex = 1;
+            cmbLogLevel.SelectedIndexChanged += CmbLogLevel_SelectedIndexChanged;
+            toolTip.SetToolTip(cmbLogLevel,
+                "Level 2 prints every CAN frame. The Arduino skips log lines that would block it " +
+                "(counted as LOGDROP in INFO), so busy buses show gaps in the log.");
+
+            logLevelPanel.Controls.Add(logLevelLabel);
+            logLevelPanel.Controls.Add(cmbLogLevel);
+            connection.Controls.Add(logLevelPanel, 0, 2);
+
+            chkTraffic = new CheckBox();
+            chkTraffic.Text = "Log serial traffic";
+            chkTraffic.Dock = DockStyle.Fill;
+            toolTip.SetToolTip(chkTraffic,
+                "Show every command sent to the Arduino and every OK reply.");
+
+            connection.Controls.Add(chkTraffic, 1, 2);
+
+            lblHealth = new Label();
+            lblHealth.Text = "Link: not connected";
+            lblHealth.Dock = DockStyle.Fill;
+            lblHealth.TextAlign = ContentAlignment.MiddleLeft;
+            lblHealth.ForeColor = Color.DimGray;
+
+            connection.Controls.Add(lblHealth, 2, 2);
+            connection.SetColumnSpan(lblHealth, 2);
 
             // PARAMETER AREA
 
@@ -415,7 +477,8 @@ namespace OBD2EngineSimulator
                 "Normal Tune",
                 "Lean Tune",
                 "Rich Tune",
-                "Bad Tune"
+                "Bad Tune",
+                "Severe Misfire"
             });
             cmbTuneMode.SelectedIndex = 0;
 
@@ -435,10 +498,31 @@ namespace OBD2EngineSimulator
             lblSimulation.ForeColor = Color.Gray;
             lblSimulation.Margin = new Padding(12, 8, 0, 0);
 
+            chkAutoDtc = new CheckBox();
+            chkAutoDtc.Text = "Auto faults";
+            chkAutoDtc.AutoSize = true;
+            chkAutoDtc.Margin = new Padding(16, 7, 0, 0);
+            toolTip.SetToolTip(chkAutoDtc,
+                "During simulation, report faults to the ECU: fuel trims beyond ±20 % for 5 s (P0171/P0172), " +
+                "Bad Tune (P0300), Severe Misfire (P0302, flashing MIL). The ECU makes them pending, then " +
+                "confirmed after two drive cycles.");
+
+            chkLinkDependent = new CheckBox();
+            chkLinkDependent.Text = "Link MAF / load to RPM, MAP, IAT";
+            chkLinkDependent.AutoSize = true;
+            chkLinkDependent.Checked = true;
+            chkLinkDependent.Margin = new Padding(16, 7, 0, 0);
+            chkLinkDependent.CheckedChanged += ChkLinkDependent_CheckedChanged;
+            toolTip.SetToolTip(chkLinkDependent,
+                "In manual mode, recalculate mass air flow and engine load (2.0 L speed-density model) " +
+                "whenever RPM, MAP or IAT change.");
+
             simulationPanel.Controls.Add(tuneLabel);
             simulationPanel.Controls.Add(cmbTuneMode);
             simulationPanel.Controls.Add(btnSimulate);
             simulationPanel.Controls.Add(lblSimulation);
+            simulationPanel.Controls.Add(chkAutoDtc);
+            simulationPanel.Controls.Add(chkLinkDependent);
 
             parameterArea.Controls.Add(simulationPanel, 0, 1);
 
@@ -451,6 +535,14 @@ namespace OBD2EngineSimulator
             parameterArea.Controls.Add(tabParameters, 0, 2);
 
             BuildParameterPages();
+            BuildDiagnosticsPage();
+            BuildVehiclePage();
+
+            if (tabParameters.TabPages.Count > 0)
+            {
+                tabParameters.SelectedIndex = 0;
+                cmbPID.SelectedIndex = 0;
+            }
 
             cmbPID.SelectedIndexChanged += CmbPID_SelectedIndexChanged;
             cmbProtocol.SelectedIndexChanged += cmbProtocol_SelectedIndexChanged;
@@ -507,10 +599,10 @@ namespace OBD2EngineSimulator
 
         private void BuildParameterPages()
         {
-            foreach (var item in parameters)
+            foreach (ParameterInfo info in ParameterDefinitions.All)
             {
-                string key = item.Key;
-                ParameterInfo info = item.Value;
+                string key = info.Key;
+                bool hasLambda = key == "AFR" || key == "MEASURED_AFR";
 
                 TabPage page = new TabPage(info.Name);
                 page.BackColor = Color.White;
@@ -519,17 +611,17 @@ namespace OBD2EngineSimulator
                 layout.Dock = DockStyle.Fill;
                 layout.Padding = new Padding(30);
                 layout.ColumnCount = 1;
-                layout.RowCount =
-                    key == "AFR" || key == "MEASURED_AFR" ? 7 : 6;
+                layout.RowCount = hasLambda ? 8 : 7;
 
                 layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 55));
                 layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 35));
                 layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 65));
                 layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 55));
                 layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 45));
-                layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+                layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+                layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
 
-                if (key == "AFR" || key == "MEASURED_AFR")
+                if (hasLambda)
                     layout.RowStyles.Add(
                         new RowStyle(SizeType.Absolute, 35));
 
@@ -542,12 +634,13 @@ namespace OBD2EngineSimulator
                 name.TextAlign = ContentAlignment.MiddleLeft;
 
                 Label pid = new Label();
-                pid.Text = info.PID == "--"
-                    ? "Simulated parameter"
-                    : "Mode 01 - PID " + info.PID;
+                pid.Text = "Mode 01 - PID " + info.PID;
                 pid.Font = new Font("Segoe UI", 10);
                 pid.ForeColor = Color.Gray;
                 pid.Dock = DockStyle.Fill;
+
+                if (key == "FUELSYS")
+                    pid.Text += "  (1 = open loop cold, 2 = closed loop, 4 = open loop driving, 8 = open loop fault, 16 = closed loop fault)";
 
                 Label valueLabel = new Label();
                 valueLabel.Text = FormatValue(info, info.DefaultValue);
@@ -558,9 +651,11 @@ namespace OBD2EngineSimulator
                 NumericUpDown numeric = new NumericUpDown();
                 numeric.Minimum = info.Minimum;
                 numeric.Maximum = info.Maximum;
-                numeric.Value = info.DefaultValue;
                 numeric.DecimalPlaces = info.DecimalPlaces;
-                numeric.Increment = info.DecimalPlaces == 0 ? 1 : 0.1m;
+                numeric.Increment = info.DecimalPlaces == 0
+                    ? 1
+                    : 1m / (decimal)Math.Pow(10, info.DecimalPlaces);
+                numeric.Value = info.DefaultValue;
                 numeric.Width = 180;
                 numeric.Font = new Font("Segoe UI", 16);
                 numeric.ThousandsSeparator = true;
@@ -579,18 +674,25 @@ namespace OBD2EngineSimulator
                 range.ForeColor = Color.Gray;
                 range.Dock = DockStyle.Fill;
 
+                Label status = new Label();
+                status.Dock = DockStyle.Fill;
+                status.Font = new Font("Segoe UI", 10, FontStyle.Bold);
+                status.TextAlign = ContentAlignment.MiddleLeft;
+
                 layout.Controls.Add(name, 0, 0);
                 layout.Controls.Add(pid, 0, 1);
                 layout.Controls.Add(valueLabel, 0, 2);
                 layout.Controls.Add(slider, 0, 3);
                 layout.Controls.Add(numeric, 0, 4);
                 layout.Controls.Add(range, 0, 5);
+                layout.Controls.Add(status, 0, 6);
 
                 numericControls[key] = numeric;
                 sliders[key] = slider;
                 valueLabels[key] = valueLabel;
+                statusLabels[key] = status;
 
-                if (key == "AFR" || key == "MEASURED_AFR")
+                if (hasLambda)
                 {
                     Label lambda = new Label();
                     lambda.Font = new Font(
@@ -598,7 +700,7 @@ namespace OBD2EngineSimulator
                     lambda.ForeColor = Color.DarkBlue;
                     lambda.Dock = DockStyle.Fill;
 
-                    layout.Controls.Add(lambda, 0, 6);
+                    layout.Controls.Add(lambda, 0, 7);
                     lambdaDisplays[key] = lambda;
 
                     UpdateLambdaDisplay(key, info.DefaultValue);
@@ -609,6 +711,15 @@ namespace OBD2EngineSimulator
                     if (updatingControls)
                         return;
 
+                    // Fuel system status allows only single-bit codes.
+                    decimal snapped = SnapToAllowed(key, numeric.Value);
+
+                    if (snapped != numeric.Value)
+                    {
+                        numeric.Value = snapped;  // raises ValueChanged again
+                        return;
+                    }
+
                     updatingControls = true;
                     slider.Value = (int)(numeric.Value * info.Scale);
                     valueLabel.Text = FormatValue(info, numeric.Value);
@@ -616,6 +727,7 @@ namespace OBD2EngineSimulator
 
                     UpdateLambdaIfNeeded(key, numeric.Value);
                     SendParameter(key);
+                    UpdateDependentValuesIfNeeded(key);
                 };
 
                 slider.ValueChanged += (sender, e) =>
@@ -624,23 +736,38 @@ namespace OBD2EngineSimulator
                         return;
 
                     updatingControls = true;
-                    numeric.Value = (decimal)slider.Value / info.Scale;
+                    numeric.Value = SnapToAllowed(key, (decimal)slider.Value / info.Scale);
+                    slider.Value = (int)(numeric.Value * info.Scale);
                     valueLabel.Text = FormatValue(info, numeric.Value);
                     updatingControls = false;
 
                     UpdateLambdaIfNeeded(key, numeric.Value);
                     SendParameter(key);
+                    UpdateDependentValuesIfNeeded(key);
                 };
 
                 tabParameters.TabPages.Add(page);
                 cmbPID.Items.Add(info.Name);
             }
+        }
 
-            if (tabParameters.TabPages.Count > 0)
-            {
-                tabParameters.SelectedIndex = 0;
-                cmbPID.SelectedIndex = 0;
-            }
+        // FUELSYS (PID 03) must be 0 or a single bit: 1, 2, 4, 8, 16. Other
+        // values snap to the next code in the direction of the change, so the
+        // arrows and the slider step 1 -> 2 -> 4 -> 8 -> 16 and back.
+        private static readonly decimal[] FuelSystemCodes = { 0, 1, 2, 4, 8, 16 };
+        private decimal lastFuelSystem = 2;
+
+        private decimal SnapToAllowed(string key, decimal value)
+        {
+            if (key != "FUELSYS")
+                return value;
+
+            decimal snapped = value >= lastFuelSystem
+                ? FuelSystemCodes.Where(code => code >= value).DefaultIfEmpty(16).Min()
+                : FuelSystemCodes.Where(code => code <= value).DefaultIfEmpty(0).Max();
+
+            lastFuelSystem = snapped;
+            return snapped;
         }
 
         private string FormatValue(ParameterInfo info, decimal value)
@@ -648,6 +775,522 @@ namespace OBD2EngineSimulator
             return value.ToString(
                 "F" + info.DecimalPlaces,
                 CultureInfo.InvariantCulture) + " " + info.Unit;
+        }
+
+        // =====================================
+        // DIAGNOSTICS PAGE (DTCs, MIL, VEHICLE INFORMATION)
+        // =====================================
+
+        private void BuildDiagnosticsPage()
+        {
+            TabPage page = new TabPage("Diagnostics");
+            page.BackColor = Color.White;
+
+            TableLayoutPanel layout = new TableLayoutPanel();
+            layout.Dock = DockStyle.Fill;
+            layout.Padding = new Padding(20);
+            layout.ColumnCount = 3;
+            layout.RowCount = 8;
+
+            for (int i = 0; i < 3; i++)
+                layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.3f));
+
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));   // MIL + freeze frame
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));   // list headers
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 40));    // lists
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));   // add / remove
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));   // DTC sync status
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));   // lifecycle header
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 60));    // lifecycle table
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));   // faults + drive cycle
+
+            page.Controls.Add(layout);
+
+            lblMil = new Label();
+            lblMil.Dock = DockStyle.Fill;
+            lblMil.Font = new Font("Segoe UI", 14, FontStyle.Bold);
+            lblMil.TextAlign = ContentAlignment.MiddleLeft;
+
+            lblFreezeFrame = new Label();
+            lblFreezeFrame.Dock = DockStyle.Fill;
+            lblFreezeFrame.TextAlign = ContentAlignment.MiddleLeft;
+            lblFreezeFrame.ForeColor = Color.DimGray;
+            lblFreezeFrame.Text = "Freeze frame: unknown";
+
+            layout.Controls.Add(lblMil, 0, 0);
+            layout.Controls.Add(lblFreezeFrame, 1, 0);
+            layout.SetColumnSpan(lblFreezeFrame, 2);
+
+            for (int i = 0; i < 3; i++)
+            {
+                Label header = new Label();
+                header.Text = DtcListNames[i].ToUpperInvariant() + " DTCs (Mode " +
+                    (i == 0 ? "03" : i == 1 ? "07" : "0A") + ")";
+                header.Font = new Font("Segoe UI", 8, FontStyle.Bold);
+                header.ForeColor = Color.Gray;
+                header.Dock = DockStyle.Fill;
+
+                ListBox list = new ListBox();
+                list.Dock = DockStyle.Fill;
+                list.Font = new Font("Consolas", 11);
+
+                dtcListBoxes[i] = list;
+
+                layout.Controls.Add(header, i, 1);
+                layout.Controls.Add(list, i, 2);
+            }
+
+            FlowLayoutPanel editPanel = new FlowLayoutPanel();
+            editPanel.Dock = DockStyle.Fill;
+            editPanel.WrapContents = false;
+
+            txtDtcCode = new TextBox();
+            txtDtcCode.Width = 90;
+            txtDtcCode.CharacterCasing = CharacterCasing.Upper;
+            txtDtcCode.MaxLength = 5;
+            txtDtcCode.PlaceholderText = "P0171";
+
+            cmbDtcType = new ComboBox();
+            cmbDtcType.DropDownStyle = ComboBoxStyle.DropDownList;
+            cmbDtcType.Width = 140;
+            cmbDtcType.Items.AddRange(DtcListNames);
+            cmbDtcType.SelectedIndex = 0;
+
+            Button btnAddDtc = new Button();
+            btnAddDtc.Text = "Add";
+            btnAddDtc.AutoSize = true;
+            btnAddDtc.Click += (sender, e) => AddDtcFromInput();
+
+            Button btnRemoveDtc = new Button();
+            btnRemoveDtc.Text = "Remove selected";
+            btnRemoveDtc.AutoSize = true;
+            btnRemoveDtc.Click += (sender, e) => RemoveSelectedDtcs();
+
+            Button btnClearDtc = new Button();
+            btnClearDtc.Text = "Clear stored + pending";
+            btnClearDtc.AutoSize = true;
+            btnClearDtc.Click += (sender, e) => ClearDtcLists(includePermanent: false);
+            toolTip.SetToolTip(btnClearDtc,
+                "Like a scan tool's Mode 04 clear: permanent DTCs stay.");
+
+            Button btnClearAllDtc = new Button();
+            btnClearAllDtc.Text = "Clear all";
+            btnClearAllDtc.AutoSize = true;
+            btnClearAllDtc.Click += (sender, e) => ClearDtcLists(includePermanent: true);
+
+            editPanel.Controls.Add(txtDtcCode);
+            editPanel.Controls.Add(cmbDtcType);
+            editPanel.Controls.Add(btnAddDtc);
+            editPanel.Controls.Add(btnRemoveDtc);
+            editPanel.Controls.Add(btnClearDtc);
+            editPanel.Controls.Add(btnClearAllDtc);
+
+            layout.Controls.Add(editPanel, 0, 3);
+            layout.SetColumnSpan(editPanel, 3);
+
+            lblDtcStatus = new Label();
+            lblDtcStatus.Dock = DockStyle.Fill;
+            lblDtcStatus.TextAlign = ContentAlignment.MiddleLeft;
+
+            layout.Controls.Add(lblDtcStatus, 0, 4);
+            layout.SetColumnSpan(lblDtcStatus, 3);
+
+            // DTC lifecycle as the ECU sees it (DTCX in the DTC? reply).
+            Label lifecycleHeader = new Label();
+            lifecycleHeader.Text = "DTC STATUS IN THE ECU (pending → confirmed after 2 failing drive cycles, " +
+                "MIL off after 3 passing cycles, erased after 40 warm-ups)";
+            lifecycleHeader.Font = new Font("Segoe UI", 8, FontStyle.Bold);
+            lifecycleHeader.ForeColor = Color.Gray;
+            lifecycleHeader.Dock = DockStyle.Fill;
+
+            layout.Controls.Add(lifecycleHeader, 0, 5);
+            layout.SetColumnSpan(lifecycleHeader, 3);
+
+            lvDtcStatus = new ListView();
+            lvDtcStatus.Dock = DockStyle.Fill;
+            lvDtcStatus.View = View.Details;
+            lvDtcStatus.FullRowSelect = true;
+            lvDtcStatus.Font = new Font("Consolas", 9);
+
+            foreach (string column in new[]
+            {
+                "Code", "ECU", "Status", "Fault now", "Pending", "Confirmed", "MIL",
+                "Permanent", "Failed cycles", "Passed cycles", "Warm-ups"
+            })
+            {
+                lvDtcStatus.Columns.Add(column, -2);
+            }
+
+            layout.Controls.Add(lvDtcStatus, 0, 6);
+            layout.SetColumnSpan(lvDtcStatus, 3);
+
+            FlowLayoutPanel faultPanel = new FlowLayoutPanel();
+            faultPanel.Dock = DockStyle.Fill;
+            faultPanel.WrapContents = false;
+
+            Label faultLabel = new Label();
+            faultLabel.Text = "FAULT:";
+            faultLabel.AutoSize = true;
+            faultLabel.Font = new Font("Segoe UI", 8, FontStyle.Bold);
+            faultLabel.ForeColor = Color.Gray;
+            faultLabel.Margin = new Padding(3, 8, 3, 0);
+
+            txtFaultCode = new TextBox();
+            txtFaultCode.Width = 90;
+            txtFaultCode.CharacterCasing = CharacterCasing.Upper;
+            txtFaultCode.MaxLength = 5;
+            txtFaultCode.PlaceholderText = "P0420";
+
+            cmbFaultSeverity = new ComboBox();
+            cmbFaultSeverity.DropDownStyle = ComboBoxStyle.DropDownList;
+            cmbFaultSeverity.Width = 170;
+            cmbFaultSeverity.Items.AddRange(new object[] { "Failing", "Severe (flashing MIL)" });
+            cmbFaultSeverity.SelectedIndex = 0;
+
+            Button btnFaultPresent = new Button();
+            btnFaultPresent.Text = "Fault present";
+            btnFaultPresent.AutoSize = true;
+            btnFaultPresent.Click += (sender, e) => ReportFaultFromInput(present: true);
+            toolTip.SetToolTip(btnFaultPresent,
+                "Report a failing test result: the ECU sets the DTC pending now and confirms it " +
+                "if it is still failing at the end of the next drive cycle.");
+
+            Button btnFaultGone = new Button();
+            btnFaultGone.Text = "Fault gone";
+            btnFaultGone.AutoSize = true;
+            btnFaultGone.Click += (sender, e) => ReportFaultFromInput(present: false);
+
+            Button btnEndCycle = new Button();
+            btnEndCycle.Text = "End drive cycle";
+            btnEndCycle.AutoSize = true;
+            btnEndCycle.Click += (sender, e) => EndDriveCycle();
+            toolTip.SetToolTip(btnEndCycle,
+                "Completes a drive cycle now (CYCLE:1). Turning the ignition off after the engine ran " +
+                "at least 60 s also completes one.");
+
+            lblCycle = new Label();
+            lblCycle.AutoSize = true;
+            lblCycle.Margin = new Padding(12, 8, 0, 0);
+            lblCycle.ForeColor = Color.DimGray;
+
+            faultPanel.Controls.Add(faultLabel);
+            faultPanel.Controls.Add(txtFaultCode);
+            faultPanel.Controls.Add(cmbFaultSeverity);
+            faultPanel.Controls.Add(btnFaultPresent);
+            faultPanel.Controls.Add(btnFaultGone);
+            faultPanel.Controls.Add(btnEndCycle);
+            faultPanel.Controls.Add(lblCycle);
+
+            layout.Controls.Add(faultPanel, 0, 7);
+            layout.SetColumnSpan(faultPanel, 3);
+
+            tabParameters.TabPages.Add(page);
+            cmbPID.Items.Add("Diagnostics (DTCs, MIL, faults, drive cycles)");
+        }
+
+        // =====================================
+        // VEHICLE & ECU PAGE
+        // =====================================
+
+        private void BuildVehiclePage()
+        {
+            TabPage page = new TabPage("Vehicle & ECU");
+            page.BackColor = Color.White;
+
+            TableLayoutPanel layout = new TableLayoutPanel();
+            layout.Dock = DockStyle.Fill;
+            layout.Padding = new Padding(20);
+            layout.ColumnCount = 4;
+            layout.RowCount = 6;
+
+            for (int i = 0; i < 4; i++)
+                layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25f));
+
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 70));   // identity fields
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));   // identity apply
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));   // odometer
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));   // TCM + response delay
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));   // factory reset
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+            page.Controls.Add(layout);
+
+            txtVin = AddIdentityField(layout, 0, 0, "VIN (17 characters, Mode 09 / 02)", DefaultVin, 17);
+            txtCalId = AddIdentityField(layout, 1, 0, "CALIBRATION ID (max 16, Mode 09 / 04)", DefaultCalibrationId, 16);
+            txtEcuName = AddIdentityField(layout, 2, 0, "ECU NAME (max 20, Mode 09 / 0A)", DefaultEcuName, 20);
+            txtEsn = AddIdentityField(layout, 3, 0, "ENGINE SERIAL (max 16, Mode 09 / 0D)", DefaultEsn, 16);
+            txtVin.CharacterCasing = CharacterCasing.Upper;
+
+            FlowLayoutPanel identityPanel = NewRowPanel();
+
+            Button btnApplyIdentity = new Button();
+            btnApplyIdentity.Text = "Apply vehicle information";
+            btnApplyIdentity.AutoSize = true;
+            btnApplyIdentity.Click += (sender, e) => ApplyIdentity();
+
+            lblIdentityStatus = new Label();
+            lblIdentityStatus.AutoSize = true;
+            lblIdentityStatus.Margin = new Padding(12, 8, 0, 0);
+
+            identityPanel.Controls.Add(btnApplyIdentity);
+            identityPanel.Controls.Add(lblIdentityStatus);
+            AddRow(layout, identityPanel, 1);
+
+            // Odometer (PID A6): kept by the ECU, set on request.
+            FlowLayoutPanel odometerPanel = NewRowPanel();
+
+            lblOdometer = new Label();
+            lblOdometer.AutoSize = true;
+            lblOdometer.Font = new Font("Segoe UI", 10, FontStyle.Bold);
+            lblOdometer.Margin = new Padding(3, 7, 20, 0);
+            lblOdometer.Text = "Odometer: unknown";
+
+            numOdometer = new NumericUpDown();
+            numOdometer.Width = 120;
+            numOdometer.Maximum = 4294967;  // firmware keeps metres in 32 bits
+            numOdometer.DecimalPlaces = 1;
+            numOdometer.ThousandsSeparator = true;
+
+            Button btnSetOdometer = new Button();
+            btnSetOdometer.Text = "Set odometer (km)";
+            btnSetOdometer.AutoSize = true;
+            btnSetOdometer.Click += (sender, e) =>
+                link.SendCommand("ODO:" + numOdometer.Value.ToString("0.0", CultureInfo.InvariantCulture));
+
+            odometerPanel.Controls.Add(lblOdometer);
+            odometerPanel.Controls.Add(numOdometer);
+            odometerPanel.Controls.Add(btnSetOdometer);
+            AddRow(layout, odometerPanel, 2);
+
+            // ECU behaviour.
+            FlowLayoutPanel ecuPanel = NewRowPanel();
+
+            chkTcm = new CheckBox();
+            chkTcm.Text = "Transmission ECU (TCM) present";
+            chkTcm.AutoSize = true;
+            chkTcm.Checked = true;
+            chkTcm.Margin = new Padding(3, 7, 20, 0);
+            chkTcm.CheckedChanged += (sender, e) =>
+            {
+                if (!updatingControls)
+                    link.SetDesired("TCM", chkTcm.Checked ? "1" : "0");
+            };
+            toolTip.SetToolTip(chkTcm,
+                "A second ECU on 7E9 / 18DAF118 that also answers broadcast requests " +
+                "(speed, gear, its own DTCs, VIN). Stored in the Arduino's EEPROM.");
+
+            Label delayLabel = new Label();
+            delayLabel.Text = "Response delay (ms):";
+            delayLabel.AutoSize = true;
+            delayLabel.Margin = new Padding(3, 8, 3, 0);
+
+            numResponseDelay = new NumericUpDown();
+            numResponseDelay.Width = 80;
+            numResponseDelay.Maximum = 5000;
+            numResponseDelay.Increment = 10;
+            numResponseDelay.ValueChanged += (sender, e) =>
+                link.SetDesired("RESPDELAY", ((int)numResponseDelay.Value).ToString(CultureInfo.InvariantCulture));
+            toolTip.SetToolTip(numResponseDelay,
+                "Simulates a slow ECU. Above 40 ms the ECU first answers 'response pending' (7F xx 78), " +
+                "repeated every 4 s.");
+
+            lblEcuSettingsStatus = new Label();
+            lblEcuSettingsStatus.AutoSize = true;
+            lblEcuSettingsStatus.Margin = new Padding(12, 8, 0, 0);
+
+            ecuPanel.Controls.Add(chkTcm);
+            ecuPanel.Controls.Add(delayLabel);
+            ecuPanel.Controls.Add(numResponseDelay);
+            ecuPanel.Controls.Add(lblEcuSettingsStatus);
+            AddRow(layout, ecuPanel, 3);
+
+            FlowLayoutPanel resetPanel = NewRowPanel();
+
+            Button btnFactoryReset = new Button();
+            btnFactoryReset.Text = "Factory reset ECU memory…";
+            btnFactoryReset.AutoSize = true;
+            btnFactoryReset.Click += (sender, e) => FactoryReset();
+
+            resetPanel.Controls.Add(btnFactoryReset);
+            AddRow(layout, resetPanel, 4);
+
+            tabParameters.TabPages.Add(page);
+            cmbPID.Items.Add("Vehicle & ECU (VIN, odometer, TCM)");
+        }
+
+        private static FlowLayoutPanel NewRowPanel()
+        {
+            FlowLayoutPanel panel = new FlowLayoutPanel();
+            panel.Dock = DockStyle.Fill;
+            panel.WrapContents = false;
+            return panel;
+        }
+
+        private static void AddRow(TableLayoutPanel layout, Control control, int row)
+        {
+            layout.Controls.Add(control, 0, row);
+            layout.SetColumnSpan(control, layout.ColumnCount);
+        }
+
+        private void FactoryReset()
+        {
+            if (!link.IsOpen)
+                return;
+
+            DialogResult answer = MessageBox.Show(
+                "Erase all DTCs, freeze frames, counters, the odometer and the vehicle information " +
+                "stored in the Arduino's EEPROM? This cannot be undone.",
+                "OBD-II Simulator", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+
+            if (answer != DialogResult.Yes)
+                return;
+
+            link.SendCommand("FACTORY:1");
+            engineModel.ResetFaultTimers();
+            Log("ECU memory reset to factory defaults.");
+        }
+
+        private TextBox AddIdentityField(TableLayoutPanel layout, int column, int row, string title, string value, int maxLength)
+        {
+            Panel field = new Panel();
+            field.Dock = DockStyle.Fill;
+            field.Padding = new Padding(0, 0, 10, 0);
+
+            Label label = new Label();
+            label.Text = title;
+            label.Dock = DockStyle.Top;
+            label.Height = 22;
+            label.Font = new Font("Segoe UI", 8, FontStyle.Bold);
+            label.ForeColor = Color.Gray;
+
+            TextBox textBox = new TextBox();
+            textBox.Dock = DockStyle.Top;
+            textBox.Font = new Font("Consolas", 11);
+            textBox.MaxLength = maxLength;
+            textBox.Text = value;
+
+            field.Controls.Add(textBox);
+            field.Controls.Add(label);
+
+            layout.Controls.Add(field, column, row);
+            return textBox;
+        }
+
+        private static bool IsValidDtc(string code) =>
+            Regex.IsMatch(code, "^[PCBU][0-3][0-9A-F]{3}$");
+
+        private static bool IsValidText(string text, int maxLength) =>
+            text.Length <= maxLength &&
+            text.All(c => c >= 0x20 && c <= 0x7E && c != ';' && c != '#' && c != '|' && c != '=');
+
+        private void AddDtcFromInput()
+        {
+            string code = txtDtcCode.Text.Trim().ToUpperInvariant();
+
+            if (!IsValidDtc(code))
+            {
+                MessageBox.Show(
+                    "Enter a DTC like P0171 (P, C, B or U, then 0-3, then three hex digits).",
+                    "OBD-II Simulator", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            AddDtc(cmbDtcType.SelectedIndex, code);
+            txtDtcCode.Clear();
+        }
+
+        private bool AddDtc(int listIndex, string code)
+        {
+            List<string> codes = dtcCodes[listIndex];
+
+            if (codes.Contains(code))
+                return false;
+
+            if (codes.Count >= MaximumDtcsPerList)
+            {
+                Log("DTC list '" + DtcListNames[listIndex] + "' is full (" + MaximumDtcsPerList + " codes).");
+                return false;
+            }
+
+            codes.Add(code);
+            PushDtcList(listIndex);
+            return true;
+        }
+
+        private void RemoveSelectedDtcs()
+        {
+            for (int i = 0; i < 3; i++)
+            {
+                if (dtcListBoxes[i].SelectedItem is string code && dtcCodes[i].Remove(code))
+                    PushDtcList(i);
+            }
+        }
+
+        // Sends DTC:CLEAR (or DTC:CLEAR:ALL), which behaves like Mode 04 and
+        // also resets the freeze frame and "since cleared" counters.
+        private void ClearDtcLists(bool includePermanent)
+        {
+            link.SendCommand(includePermanent ? "DTC:CLEAR:ALL" : "DTC:CLEAR");
+            engineModel.ResetFaultTimers();
+
+            for (int i = 0; i < 3; i++)
+            {
+                if (i == 2 && !includePermanent)
+                    continue;
+
+                if (dtcCodes[i].Count == 0)
+                    continue;
+
+                dtcCodes[i].Clear();
+                PushDtcList(i);
+            }
+        }
+
+        private void PushDtcList(int listIndex)
+        {
+            RefreshDtcListBox(listIndex);
+            link.SetDesired(DtcKeys[listIndex], string.Join(",", dtcCodes[listIndex]));
+            UpdateDtcStatus();
+        }
+
+        private void RefreshDtcListBox(int listIndex)
+        {
+            ListBox list = dtcListBoxes[listIndex];
+            list.BeginUpdate();
+            list.Items.Clear();
+
+            foreach (string code in dtcCodes[listIndex])
+                list.Items.Add(code);
+
+            list.EndUpdate();
+        }
+
+        private void ApplyIdentity()
+        {
+            string vin = txtVin.Text.Trim().ToUpperInvariant();
+            string calId = txtCalId.Text.Trim();
+            string ecuName = txtEcuName.Text.Trim();
+            string esn = txtEsn.Text.Trim();
+
+            if (!Regex.IsMatch(vin, "^[A-HJ-NPR-Z0-9]{17}$"))
+            {
+                MessageBox.Show("The VIN must be 17 characters: digits and capital letters except I, O and Q.",
+                    "OBD-II Simulator", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            if (!IsValidText(calId, 16) || !IsValidText(ecuName, 20) || !IsValidText(esn, 16))
+            {
+                MessageBox.Show("Calibration ID (max 16), ECU name (max 20) and engine serial (max 16) must be " +
+                    "printable ASCII without ; # | or =.", "OBD-II Simulator", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            link.SetDesired("VIN", vin);
+            link.SetDesired("CALID", calId);
+            link.SetDesired("ECUNAME", ecuName);
+            link.SetDesired("ESN", esn);
+            UpdateIdentityStatus();
         }
 
         // =====================================
@@ -684,8 +1327,41 @@ namespace OBD2EngineSimulator
 
             updatingControls = false;
 
+            if (key == "FUELSYS")
+                lastFuelSystem = value;
+
             UpdateLambdaIfNeeded(key, value);
             SendParameter(key);
+        }
+
+        // =====================================
+        // LINKED VALUES (manual mode)
+        // =====================================
+
+        private void UpdateDependentValuesIfNeeded(string key)
+        {
+            if (simulationRunning || !chkLinkDependent.Checked)
+                return;
+
+            if (key == "RPM" || key == "MAP" || key == "IAT")
+                UpdateDependentValues();
+        }
+
+        private void UpdateDependentValues()
+        {
+            (double maf, double load) = EngineModel.ComputeAirflow(
+                (double)numericControls["RPM"].Value,
+                (double)numericControls["MAP"].Value,
+                (double)numericControls["IAT"].Value);
+
+            SetParameterValue("MAF", (decimal)maf);
+            SetParameterValue("LOAD", (decimal)load);
+        }
+
+        private void ChkLinkDependent_CheckedChanged(object? sender, EventArgs e)
+        {
+            if (chkLinkDependent.Checked && !simulationRunning)
+                UpdateDependentValues();
         }
 
         // =====================================
@@ -693,7 +1369,7 @@ namespace OBD2EngineSimulator
         // =====================================
 
         private void CmbPID_SelectedIndexChanged(
-            object sender,
+            object? sender,
             EventArgs e)
         {
             if (cmbPID.SelectedIndex < 0)
@@ -702,7 +1378,7 @@ namespace OBD2EngineSimulator
             tabParameters.SelectedIndex = cmbPID.SelectedIndex;
 
             Log("Selected parameter: " +
-                cmbPID.SelectedItem.ToString());
+                cmbPID.SelectedItem);
         }
 
         // =====================================
@@ -731,11 +1407,21 @@ namespace OBD2EngineSimulator
         // DRIVING SIMULATOR
         // =====================================
 
-        private void BtnSimulate_Click(object sender, EventArgs e)
+        private TuneMode SelectedTuneMode =>
+            cmbTuneMode.SelectedIndex switch
+            {
+                1 => TuneMode.Lean,
+                2 => TuneMode.Rich,
+                3 => TuneMode.Bad,
+                4 => TuneMode.Misfire,
+                _ => TuneMode.Normal
+            };
+
+        private void BtnSimulate_Click(object? sender, EventArgs e)
         {
             if (!simulationRunning)
             {
-                if (serialPort == null || !serialPort.IsOpen)
+                if (!link.IsOpen)
                 {
                     MessageBox.Show(
                         "Please connect to the Arduino before starting the simulation.",
@@ -745,7 +1431,15 @@ namespace OBD2EngineSimulator
                     return;
                 }
 
-                simulationTime = 0;
+                // Continue from the current temperatures and fuel level.
+                engineModel.Reset(
+                    (double)numericControls["ECT"].Value,
+                    (double)numericControls["OIL"].Value,
+                    (double)numericControls["IAT"].Value,
+                    (double)numericControls["FUEL"].Value,
+                    (double)numericControls["AMBIENT"].Value,
+                    (double)numericControls["BARO"].Value);
+
                 simulationStopwatch.Restart();
 
                 simulationRunning = true;
@@ -773,216 +1467,108 @@ namespace OBD2EngineSimulator
 
         private void StopSimulation()
         {
-            if (simulationTimer != null)
-                simulationTimer.Stop();
+            if (!simulationRunning)
+                return;
 
+            simulationTimer.Stop();
             simulationStopwatch.Stop();
             simulationRunning = false;
 
-            if (btnSimulate != null)
-            {
-                btnSimulate.Text = "SIMULATE";
-                btnSimulate.BackColor = Color.FromArgb(35, 125, 75);
-            }
+            btnSimulate.Text = "SIMULATE";
+            btnSimulate.BackColor = Color.FromArgb(35, 125, 75);
 
-            if (cmbTuneMode != null)
-                cmbTuneMode.Enabled = true;
+            cmbTuneMode.Enabled = true;
 
-            if (lblSimulation != null)
-            {
-                lblSimulation.Text = "SIMULATION STOPPED";
-                lblSimulation.ForeColor = Color.Gray;
-            }
+            lblSimulation.Text = "SIMULATION STOPPED";
+            lblSimulation.ForeColor = Color.Gray;
+
+            // Faults the simulation reported end with it.
+            foreach (string code in simulationFaults)
+                SetFault(code, 0);
+
+            simulationFaults.Clear();
 
             Log("Driving simulation stopped. Manual controls restored.");
         }
 
-        private void SimulationTimer_Tick(object sender, EventArgs e)
+        // =====================================
+        // FAULTS AND DRIVE CYCLES
+        // =====================================
+
+        // Reports a live fault state to the firmware, which runs the DTC
+        // lifecycle (pending, confirmed after two drive cycles, MIL off after
+        // three passing cycles).
+        private void SetFault(string code, int severity, bool force = false)
+        {
+            faultStates.TryGetValue(code, out int current);
+
+            if (current == severity && !force)
+                return;
+
+            faultStates[code] = severity;
+            link.SendCommand("FAULT:" + code + ":" + severity.ToString(CultureInfo.InvariantCulture));
+            Log(severity == 0
+                ? "Fault " + code + " gone (passing test reported)."
+                : "Fault " + code + " present (severity " + severity + ").");
+        }
+
+        // Re-sends every known fault state, passed ones included, so a lost
+        // FAULT command (disconnect, Arduino restart) cannot leave the
+        // firmware with a stale state. The firmware only saves real changes.
+        private void ResendFaultStates()
+        {
+            foreach (KeyValuePair<string, int> fault in faultStates)
+                link.SendCommand("FAULT:" + fault.Key + ":" + fault.Value.ToString(CultureInfo.InvariantCulture));
+        }
+
+        private void ReportFaultFromInput(bool present)
+        {
+            string code = txtFaultCode.Text.Trim().ToUpperInvariant();
+
+            if (!IsValidDtc(code))
+            {
+                MessageBox.Show(
+                    "Enter a DTC like P0171 (P, C, B or U, then 0-3, then three hex digits).",
+                    "OBD-II Simulator", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            // Always sent, even if the app already thinks so.
+            SetFault(code, present ? cmbFaultSeverity.SelectedIndex + 1 : 0, force: true);
+        }
+
+        private void EndDriveCycle()
+        {
+            if (!link.IsOpen)
+                return;
+
+            link.SendCommand("CYCLE:1");
+            Log("Drive cycle ended (failing codes advance, passing codes count towards MIL off).");
+        }
+
+        private void SimulationTimer_Tick(object? sender, EventArgs e)
         {
             if (!simulationRunning)
                 return;
 
-            simulationTime = simulationStopwatch.Elapsed.TotalSeconds % 60.0;
-
             UpdateDrivingSimulation();
-        }
-
-        private double SmoothStep(double value)
-        {
-            value = Math.Max(0, Math.Min(1, value));
-            return value * value * (3.0 - 2.0 * value);
-        }
-
-        private double Lerp(double start, double end, double amount)
-        {
-            return start + (end - start) * amount;
         }
 
         private void UpdateDrivingSimulation()
         {
-            double t = simulationTime;
+            EngineSnapshot snapshot = engineModel.Step(
+                simulationStopwatch.Elapsed.TotalSeconds,
+                SelectedTuneMode,
+                chkAutoDtc.Checked);
 
-            double rpm = 850;
-            double speed = 0;
-            double tps = 2;
-            double map = 35;
-            double load = 18;
-            double timing = 18;
-            double commandedAfr = 14.7;
-            double maf = 3.5;
+            foreach (KeyValuePair<string, double> value in snapshot.Values)
+                SetParameterValue(value.Key, (decimal)value.Value);
 
-            // 0-8 seconds: idle
-
-            if (t < 8)
+            foreach (KeyValuePair<string, int> fault in snapshot.Faults)
             {
-                rpm = 850 + 20 * Math.Sin(t * 1.2);
-                speed = 0;
-                tps = 2 + Math.Sin(t) * 0.5;
-                map = 35 + Math.Sin(t * 0.8) * 2;
-                load = 18 + Math.Sin(t) * 1.5;
-                timing = 18 + Math.Sin(t * 0.5) * 2;
-                commandedAfr = 14.7;
+                simulationFaults.Add(fault.Key);
+                SetFault(fault.Key, fault.Value);
             }
-
-            // 8-20 seconds: acceleration
-
-            else if (t < 20)
-            {
-                double p = SmoothStep((t - 8) / 12.0);
-
-                rpm = Lerp(850, 6500, p);
-                speed = Lerp(0, 145, p);
-                tps = Lerp(5, 85, p);
-                map = Lerp(35, 160, p);
-                load = Lerp(20, 95, p);
-                timing = Lerp(18, 5, p);
-                commandedAfr = Lerp(14.7, 12.5, p);
-            }
-
-            // 20-22 seconds: gear change
-
-            else if (t < 22)
-            {
-                double p = SmoothStep((t - 20) / 2.0);
-
-                rpm = Lerp(6500, 4300, p);
-                speed = Lerp(145, 155, p);
-                tps = Lerp(85, 45, p);
-                map = Lerp(160, 85, p);
-                load = Lerp(95, 55, p);
-                timing = Lerp(5, 12, p);
-                commandedAfr = Lerp(12.5, 13.2, p);
-            }
-
-            // 22-38 seconds: cruising
-
-            else if (t < 38)
-            {
-                double wave = Math.Sin((t - 22) * 0.5);
-
-                rpm = 3000 + wave * 180;
-                speed = 110 + wave * 3;
-                tps = 22 + wave * 2;
-                map = 55 + wave * 4;
-                load = 35 + wave * 3;
-                timing = 18 + wave * 2;
-                commandedAfr = 14.7;
-            }
-
-            // 38-50 seconds: deceleration
-
-            else if (t < 50)
-            {
-                double p = SmoothStep((t - 38) / 12.0);
-
-                rpm = Lerp(3000, 850, p);
-                speed = Lerp(110, 0, p);
-                tps = Lerp(15, 0, p);
-                map = Lerp(45, 28, p);
-                load = Lerp(25, 15, p);
-                timing = Lerp(20, 12, p);
-                commandedAfr = Lerp(14.7, 16.0, p);
-            }
-
-            // 50-60 seconds: idle
-
-            else
-            {
-                double wave = Math.Sin((t - 50) * 0.8);
-
-                rpm = 850 + wave * 15;
-                speed = 0;
-                tps = 1.5;
-                map = 34 + wave * 1.5;
-                load = 17 + wave;
-                timing = 18 + wave;
-                commandedAfr = 14.7;
-            }
-
-            // Airflow estimate
-
-            maf = 2.0 + (rpm / 6500.0) * (load / 100.0) * 220.0;
-            maf = Math.Max(0, Math.Min(254, maf));
-
-            // TUNE MODES
-
-            double stft;
-            double ltft;
-            double measuredAfr;
-
-            string mode = cmbTuneMode.SelectedItem?.ToString()
-                ?? "Normal Tune";
-
-            double slowWave = Math.Sin(t * 0.65);
-            double fastWave = Math.Sin(t * 1.7);
-
-            if (mode == "Lean Tune")
-            {
-                stft = 25 + slowWave * 8;
-                ltft = 12 + Math.Sin(t * 0.15) * 2;
-                measuredAfr = commandedAfr + 1.8 + fastWave * 0.35;
-            }
-            else if (mode == "Rich Tune")
-            {
-                stft = -25 + slowWave * 8;
-                ltft = -12 + Math.Sin(t * 0.15) * 2;
-                measuredAfr = commandedAfr - 1.8 + fastWave * 0.35;
-            }
-            else if (mode == "Bad Tune")
-            {
-                stft = 30 * Math.Sin(t * 0.65);
-                ltft = 18 * Math.Sin(t * 0.22);
-                measuredAfr = commandedAfr +
-                    2.2 * Math.Sin(t * 0.65) +
-                    0.8 * Math.Sin(t * 1.7);
-            }
-            else
-            {
-                stft = 1.5 + slowWave * 2;
-                ltft = -1.5 + Math.Sin(t * 0.15);
-                measuredAfr = commandedAfr + fastWave * 0.08;
-            }
-
-            stft = Math.Max(-100, Math.Min(99.2, stft));
-            ltft = Math.Max(-100, Math.Min(99.2, ltft));
-            measuredAfr = Math.Max(8, Math.Min(20, measuredAfr));
-
-            // APPLY ALL ENGINE PARAMETERS
-
-            SetParameterValue("RPM", (decimal)rpm);
-            SetParameterValue("MAP", (decimal)map);
-            SetParameterValue("STFT", (decimal)stft);
-            SetParameterValue("LTFT", (decimal)ltft);
-            SetParameterValue("AFR", (decimal)commandedAfr);
-            SetParameterValue("MEASURED_AFR", (decimal)measuredAfr);
-            SetParameterValue("TPS", (decimal)tps);
-            SetParameterValue("SPEED", (decimal)speed);
-            SetParameterValue("LOAD", (decimal)load);
-            SetParameterValue("MAF", (decimal)maf);
-            SetParameterValue("TIMING", (decimal)timing);
-
-            SetParameterValue("ECT", 90);
-            SetParameterValue("IAT", 30);
         }
 
         // =====================================
@@ -991,7 +1577,7 @@ namespace OBD2EngineSimulator
 
         private void RefreshPorts()
         {
-            string previousPort = cmbPorts.SelectedItem?.ToString();
+            string? previousPort = cmbPorts.SelectedItem?.ToString();
 
             cmbPorts.Items.Clear();
 
@@ -1009,34 +1595,49 @@ namespace OBD2EngineSimulator
             Log("COM ports refreshed. Found: " + ports.Length);
         }
 
-        private void btnRefresh_Click(object sender, EventArgs e)
+        private void btnRefresh_Click(object? sender, EventArgs e)
         {
             RefreshPorts();
         }
 
         // =====================================
-        // CAN PROTOCOL SELECTION
+        // ECU SETTINGS (CAN, IGNITION, LOG LEVEL)
         // =====================================
 
         private void cmbProtocol_SelectedIndexChanged(
-            object sender,
+            object? sender,
             EventArgs e)
         {
-            if (SelectedProtocol == null)
+            CanProtocolOption? protocol = SelectedProtocol;
+
+            if (protocol == null)
                 return;
 
-            Log("CAN protocol selected: " + SelectedProtocol.Name);
-            Log("Request ID: " + SelectedProtocol.RequestID);
-            Log("Response ID: " + SelectedProtocol.ResponseID);
+            Log("CAN protocol selected: " + protocol.Name +
+                " (request " + protocol.RequestID + ", response " + protocol.ResponseID + ")");
+
+            link.SetDesired("CAN", protocol.Mode.ToString(CultureInfo.InvariantCulture));
+            UpdateProtocolLabel();
+        }
+
+        private void ChkIgnition_CheckedChanged(object? sender, EventArgs e)
+        {
+            link.SetDesired("IGN", chkIgnition.Checked ? "1" : "0");
+            UpdateIgnitionLabel();
+        }
+
+        private void CmbLogLevel_SelectedIndexChanged(object? sender, EventArgs e)
+        {
+            link.SetDesired("LOG", cmbLogLevel.SelectedIndex.ToString(CultureInfo.InvariantCulture));
         }
 
         // =====================================
         // CONNECT / DISCONNECT
         // =====================================
 
-        private void BtnConnect_Click(object sender, EventArgs e)
+        private void BtnConnect_Click(object? sender, EventArgs e)
         {
-            if (serialPort != null && serialPort.IsOpen)
+            if (link.IsOpen)
             {
                 DisconnectArduino();
                 return;
@@ -1050,31 +1651,18 @@ namespace OBD2EngineSimulator
 
             try
             {
-                serialPort = new SerialPort(
-                    cmbPorts.SelectedItem.ToString(),
-                    int.Parse(cmbBaud.SelectedItem.ToString()),
-                    Parity.None,
-                    8,
-                    StopBits.One
-                );
+                string portName = cmbPorts.SelectedItem.ToString()!;
+                int baud = int.Parse(cmbBaud.SelectedItem?.ToString() ?? "115200", CultureInfo.InvariantCulture);
 
-                serialPort.NewLine = "\n";
-                serialPort.WriteTimeout = 250;
-                serialPort.ReadTimeout = 250;
-                serialPort.DataReceived += SerialPort_DataReceived;
-
-                serialPort.Open();
+                link.Open(portName, baud);
 
                 btnConnect.Text = "Disconnect";
                 lblStatus.Text = "CONNECTED";
                 lblStatus.ForeColor = Color.Green;
+                firmwareVersion = "";
 
-                Log("Connected to " + serialPort.PortName);
-
-                if (SelectedProtocol != null)
-                    Log("Selected ECU protocol: " + SelectedProtocol.Name);
-
-                startupTimer.Start();
+                Log("Connected to " + portName + " at " + baud + " baud.");
+                RefreshAllStatus();
             }
             catch (Exception ex)
             {
@@ -1084,58 +1672,20 @@ namespace OBD2EngineSimulator
             }
         }
 
-        private void StartupTimer_Tick(object sender, EventArgs e)
-        {
-            startupTimer.Stop();
-
-            Log("Sending initial engine parameters...");
-
-            foreach (string key in parameters.Keys)
-                SendParameter(key);
-        }
-
         private void DisconnectArduino()
         {
             StopSimulation();
-
-            if (startupTimer != null)
-                startupTimer.Stop();
-
-            if (sendQueueTimer != null)
-                sendQueueTimer.Stop();
-
-            pendingParameterOrder.Clear();
-            queuedParameters.Clear();
-            pendingParameterCommands.Clear();
-
-            try
-            {
-                if (serialPort != null)
-                {
-                    serialPort.DataReceived -= SerialPort_DataReceived;
-
-                    if (serialPort.IsOpen)
-                        serialPort.Close();
-
-                    serialPort.Dispose();
-                    serialPort = null;
-                }
-            }
-            catch (Exception ex)
-            {
-                Log("DISCONNECT ERROR: " + ex.Message);
-            }
-
-            if (btnConnect != null)
-                btnConnect.Text = "Connect";
-
-            if (lblStatus != null)
-            {
-                lblStatus.Text = "DISCONNECTED";
-                lblStatus.ForeColor = Color.Red;
-            }
-
+            link.Close();
+            SetDisconnectedUi();
             Log("Disconnected.");
+        }
+
+        private void SetDisconnectedUi()
+        {
+            btnConnect.Text = "Connect";
+            lblStatus.Text = "DISCONNECTED";
+            lblStatus.ForeColor = Color.Red;
+            RefreshAllStatus();
         }
 
         // =====================================
@@ -1144,103 +1694,389 @@ namespace OBD2EngineSimulator
 
         private void SendParameter(string key)
         {
-            if (serialPort == null || !serialPort.IsOpen)
-                return;
-
             if (!numericControls.ContainsKey(key))
                 return;
 
-            ParameterInfo info = parameters[key];
-            decimal value = numericControls[key].Value;
-
-            string command = info.Command + ":" +
-                value.ToString(CultureInfo.InvariantCulture);
-
-            // Replace any older pending value for this parameter.
-
-            pendingParameterCommands[key] = command;
-
-            if (queuedParameters.Add(key))
-                pendingParameterOrder.Enqueue(key);
-
-            if (!sendQueueTimer.Enabled)
-                sendQueueTimer.Start();
-        }
-
-        private void SendQueueTimer_Tick(object sender, EventArgs e)
-        {
-            if (serialPort == null || !serialPort.IsOpen)
-            {
-                sendQueueTimer.Stop();
-                pendingParameterOrder.Clear();
-                queuedParameters.Clear();
-                pendingParameterCommands.Clear();
-                return;
-            }
-
-            if (pendingParameterOrder.Count == 0)
-            {
-                sendQueueTimer.Stop();
-                return;
-            }
-
-            string key = pendingParameterOrder.Dequeue();
-            queuedParameters.Remove(key);
-
-            if (!pendingParameterCommands.TryGetValue(
-                key, out string command))
-                return;
-
-            pendingParameterCommands.Remove(key);
-
-            try
-            {
-                serialPort.WriteLine(command);
-                Log("TX: " + command);
-            }
-            catch (Exception ex)
-            {
-                Log("SEND ERROR: " + ex.Message);
-            }
-
-            if (pendingParameterOrder.Count == 0)
-                sendQueueTimer.Stop();
+            link.SetParameter(key, numericControls[key].Value);
+            UpdateParameterStatus(key);
         }
 
         // =====================================
-        // RECEIVE ARDUINO MESSAGES
+        // CONFIRMATION STATUS
         // =====================================
 
-        private void SerialPort_DataReceived(
-            object sender,
-            SerialDataReceivedEventArgs e)
+        private void Link_LogMessage(string message, bool isTraffic)
         {
-            try
-            {
-                SerialPort port = sender as SerialPort;
+            if (!isTraffic || chkTraffic.Checked)
+                Log(message);
 
-                if (port == null || !port.IsOpen)
+            // A scan tool cleared the DTCs: faults must be detected again.
+            if (message.Contains("EVENT DTC CLEARED BY TESTER", StringComparison.Ordinal))
+                engineModel.ResetFaultTimers();
+        }
+
+        private void Link_ItemChanged(LinkItem item)
+        {
+            if (parameters.ContainsKey(item.Key))
+            {
+                UpdateParameterStatus(item.Key);
+                return;
+            }
+
+            switch (item.Key)
+            {
+                case "CAN":
+                    UpdateProtocolLabel();
+                    break;
+
+                case "IGN":
+                    UpdateIgnitionLabel();
+                    break;
+
+                case "VIN":
+                case "CALID":
+                case "ECUNAME":
+                case "ESN":
+                    UpdateIdentityStatus();
+                    break;
+
+                case "TCM":
+                case "RESPDELAY":
+                    UpdateEcuSettingsStatus();
+                    break;
+
+                case "DTC_S":
+                case "DTC_P":
+                case "DTC_X":
+                    UpdateDtcStatus();
+                    break;
+            }
+        }
+
+        // A value stored on the Arduino differs from what the app showed
+        // (read on connect, DTC lifecycle, scan-tool clear): show the ECU's value.
+        private void Link_ItemAdopted(LinkItem item)
+        {
+            switch (item.Key)
+            {
+                case "VIN": txtVin.Text = item.Desired; return;
+                case "CALID": txtCalId.Text = item.Desired; return;
+                case "ECUNAME": txtEcuName.Text = item.Desired; return;
+                case "ESN": txtEsn.Text = item.Desired; return;
+
+                case "TCM":
+                    updatingControls = true;
+                    chkTcm.Checked = item.Desired == "1";
+                    updatingControls = false;
+                    UpdateEcuSettingsStatus();
                     return;
+            }
 
-                while (port.BytesToRead > 0)
-                {
-                    string message = port.ReadLine().Trim();
+            int index = Array.IndexOf(DtcKeys, item.Key);
 
-                    if (!string.IsNullOrWhiteSpace(message))
-                        incomingLogMessages.Enqueue(
-                            "ARDUINO RX: " + message);
-                }
-            }
-            catch (TimeoutException)
+            if (index < 0)
+                return;
+
+            dtcCodes[index].Clear();
+            dtcCodes[index].AddRange(item.Desired.Split(',', StringSplitOptions.RemoveEmptyEntries));
+            RefreshDtcListBox(index);
+            UpdateDtcStatus();
+        }
+
+        private void Link_DeviceStatus(string name, string value)
+        {
+            switch (name)
             {
+                case "FW":
+                    if (firmwareVersion != value)
+                    {
+                        firmwareVersion = value;
+
+                        if (link.IsOpen)
+                            lblStatus.Text = "CONNECTED (FW " + value + ")";
+                    }
+                    break;
+
+                case "CANOK":
+                    canInitOk = value == "1";
+                    UpdateProtocolLabel();
+                    break;
+
+                case "MIL":
+                    lblMil.Text = value == "2" ? "MIL FLASHING" : value == "1" ? "MIL ON" : "MIL OFF";
+                    lblMil.ForeColor = value == "2" ? Color.Firebrick
+                        : value == "1" ? Color.DarkOrange
+                        : Color.FromArgb(35, 125, 75);
+                    break;
+
+                case "ODO":
+                    lblOdometer.Text = "Odometer: " + value + " km";
+                    break;
+
+                case "CYCLE":
+                    lblCycle.Text = "Drive cycles since Arduino start: " + value;
+                    break;
+
+                case "DTCX":
+                    ShowDtcLifecycle(value);
+                    break;
+
+                case "FF":
+                    lblFreezeFrame.Text = value == "-"
+                        ? "Freeze frame: none stored"
+                        : "Freeze frame: captured when " + value + " was stored (Mode 02)";
+                    break;
             }
-            catch (InvalidOperationException)
+        }
+
+        private void Link_ConnectionLost()
+        {
+            StopSimulation();
+            SetDisconnectedUi();
+            MessageBox.Show("The connection to the Arduino was lost.", "OBD-II Simulator",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
+        private static string StatusSymbol(LinkItem item) => item.Status switch
+        {
+            ValueStatus.Confirmed => "✓",
+            ValueStatus.Clamped => "⚠",
+            ValueStatus.Failed => "✗",
+            _ => "…"
+        };
+
+        private static Color StatusColor(ValueStatus status) => status switch
+        {
+            ValueStatus.Confirmed => Color.FromArgb(35, 125, 75),
+            ValueStatus.Clamped => Color.DarkOrange,
+            ValueStatus.Failed => Color.Firebrick,
+            _ => Color.Gray
+        };
+
+        private void UpdateParameterStatus(string key)
+        {
+            if (!statusLabels.TryGetValue(key, out Label? label))
+                return;
+
+            LinkItem item = link.GetItem(key);
+            ParameterInfo info = parameters[key];
+            string confirmed = item.Confirmed + " " + info.Unit;
+
+            if (!link.IsOpen)
             {
+                label.Text = "Not connected - value is sent when the Arduino connects";
+                label.ForeColor = Color.Gray;
+                return;
             }
-            catch (Exception ex)
+
+            label.Text = item.Status switch
             {
-                incomingLogMessages.Enqueue(
-                    "RECEIVE ERROR: " + ex.Message);
+                ValueStatus.Confirmed => "✓ Confirmed by Arduino: " + confirmed,
+                ValueStatus.Clamped => "⚠ Arduino applied " + confirmed + " (limited by firmware range)",
+                ValueStatus.Failed => "✗ Not confirmed: " + item.FailureReason,
+                _ => "… Waiting for Arduino confirmation" +
+                     (item.Confirmed != null ? " (last confirmed " + confirmed + ")" : "")
+            };
+
+            label.ForeColor = StatusColor(item.Status);
+        }
+
+        private void UpdateProtocolLabel()
+        {
+            if (!link.IsOpen)
+            {
+                lblConnection.Text = "Active CAN: not connected";
+                lblConnection.ForeColor = Color.DimGray;
+                return;
+            }
+
+            LinkItem item = link.GetItem("CAN");
+
+            if (item.Status == ValueStatus.Confirmed && !canInitOk)
+            {
+                lblConnection.Text = "CAN: " + DescribeCanMode(item.Confirmed) + " - MCP2515 init failed";
+                lblConnection.ForeColor = Color.Firebrick;
+                return;
+            }
+
+            lblConnection.Text = item.Status switch
+            {
+                ValueStatus.Confirmed => "Active CAN: " + DescribeCanMode(item.Confirmed) + " ✓",
+                ValueStatus.Failed => "CAN change failed: " + item.FailureReason,
+                _ => "Switching CAN to " + DescribeCanMode(item.Desired) + " …"
+            };
+
+            lblConnection.ForeColor = StatusColor(item.Status);
+        }
+
+        private void UpdateIgnitionLabel()
+        {
+            LinkItem item = link.GetItem("IGN");
+            string state = chkIgnition.Checked ? "IGNITION ON" : "IGNITION OFF";
+
+            chkIgnition.Text = link.IsOpen ? state + " " + StatusSymbol(item) : state;
+            chkIgnition.ForeColor = link.IsOpen ? StatusColor(item.Status) : SystemColors.ControlText;
+        }
+
+        private void UpdateDtcStatus()
+        {
+            if (!link.IsOpen)
+            {
+                lblDtcStatus.Text = "DTC lists: not connected";
+                lblDtcStatus.ForeColor = Color.Gray;
+                return;
+            }
+
+            LinkItem[] items = DtcKeys.Select(link.GetItem).ToArray();
+
+            lblDtcStatus.Text = "Arduino DTC lists:  " + string.Join("   ",
+                items.Select((item, i) => DtcListNames[i] + " " + StatusSymbol(item) +
+                    (item.Status == ValueStatus.Failed ? " (" + item.FailureReason + ")" : "")));
+
+            ValueStatus worst = items.Max(item => item.Status == ValueStatus.Failed ? 3 :
+                item.Status == ValueStatus.Clamped ? 2 : item.Status == ValueStatus.Pending ? 1 : 0) switch
+            {
+                3 => ValueStatus.Failed,
+                2 => ValueStatus.Clamped,
+                1 => ValueStatus.Pending,
+                _ => ValueStatus.Confirmed
+            };
+
+            lblDtcStatus.ForeColor = StatusColor(worst);
+        }
+
+        private void UpdateIdentityStatus()
+        {
+            if (!link.IsOpen)
+            {
+                lblIdentityStatus.Text = "Not connected";
+                lblIdentityStatus.ForeColor = Color.Gray;
+                return;
+            }
+
+            LinkItem vin = link.GetItem("VIN");
+            LinkItem calId = link.GetItem("CALID");
+            LinkItem ecuName = link.GetItem("ECUNAME");
+            LinkItem esn = link.GetItem("ESN");
+
+            lblIdentityStatus.Text =
+                "VIN " + StatusSymbol(vin) +
+                "   Calibration ID " + StatusSymbol(calId) +
+                "   ECU name " + StatusSymbol(ecuName) +
+                "   Engine serial " + StatusSymbol(esn);
+
+            bool allConfirmed = vin.Status == ValueStatus.Confirmed &&
+                calId.Status == ValueStatus.Confirmed &&
+                ecuName.Status == ValueStatus.Confirmed &&
+                esn.Status == ValueStatus.Confirmed;
+
+            lblIdentityStatus.ForeColor = allConfirmed
+                ? StatusColor(ValueStatus.Confirmed)
+                : Color.Gray;
+        }
+
+        private void UpdateEcuSettingsStatus()
+        {
+            if (!link.IsOpen)
+            {
+                lblEcuSettingsStatus.Text = "Not connected";
+                lblEcuSettingsStatus.ForeColor = Color.Gray;
+                return;
+            }
+
+            LinkItem tcm = link.GetItem("TCM");
+            LinkItem delay = link.GetItem("RESPDELAY");
+
+            lblEcuSettingsStatus.Text = "TCM " + StatusSymbol(tcm) + "   Response delay " + StatusSymbol(delay);
+            lblEcuSettingsStatus.ForeColor =
+                tcm.Status == ValueStatus.Confirmed && delay.Status == ValueStatus.Confirmed
+                    ? StatusColor(ValueStatus.Confirmed)
+                    : Color.Gray;
+        }
+
+        // DTCX=<code>:<status hex>:<failed cycles>:<passed cycles>:<warm-ups>:<permanent>:<E|T>,...
+        private void ShowDtcLifecycle(string value)
+        {
+            lvDtcStatus.BeginUpdate();
+            lvDtcStatus.Items.Clear();
+
+            foreach (string entry in value.Split(',', StringSplitOptions.RemoveEmptyEntries))
+            {
+                string[] fields = entry.Split(':');
+
+                if (fields.Length != 7 ||
+                    !int.TryParse(fields[1], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out int status))
+                    continue;
+
+                string Flag(int bit) => (status & bit) != 0 ? "yes" : "";
+
+                ListViewItem row = new ListViewItem(fields[0]);
+                row.SubItems.Add(fields[6] == "T" ? "TCM" : "ECM");
+                row.SubItems.Add(fields[1]);
+                row.SubItems.Add(Flag(0x01));
+                row.SubItems.Add(Flag(0x04));
+                row.SubItems.Add(Flag(0x08));
+                row.SubItems.Add(Flag(0x80));
+                row.SubItems.Add(fields[5] == "1" ? "yes" : "");
+                row.SubItems.Add(fields[2]);
+                row.SubItems.Add(fields[3]);
+                row.SubItems.Add(fields[4]);
+                lvDtcStatus.Items.Add(row);
+            }
+
+            lvDtcStatus.EndUpdate();
+        }
+
+        private void UpdateHealthLabel()
+        {
+            if (!link.IsOpen)
+            {
+                lblHealth.Text = "Link: not connected";
+                lblHealth.ForeColor = Color.DimGray;
+                return;
+            }
+
+            if (!link.IsReady)
+            {
+                lblHealth.Text = "Link: waiting for the Arduino...";
+                lblHealth.ForeColor = Color.DimGray;
+                return;
+            }
+
+            long? age = link.MillisecondsSinceLastReply;
+
+            lblHealth.Text =
+                "Link: " + (link.Responding ? "OK" : "NOT RESPONDING") +
+                " | last reply " + (age.HasValue ? age.Value + " ms ago" : "never") +
+                " | RTT " + link.LastRoundTripMs + " ms" +
+                " | retries " + link.RetryCount +
+                " | failed " + link.FailureCount;
+
+            lblHealth.ForeColor = link.Responding
+                ? Color.FromArgb(35, 125, 75)
+                : Color.Firebrick;
+        }
+
+        private void RefreshAllStatus()
+        {
+            foreach (string key in statusLabels.Keys)
+                UpdateParameterStatus(key);
+
+            UpdateProtocolLabel();
+            UpdateIgnitionLabel();
+            UpdateDtcStatus();
+            UpdateIdentityStatus();
+            UpdateEcuSettingsStatus();
+            UpdateHealthLabel();
+
+            if (!link.IsOpen)
+            {
+                lblMil.Text = "MIL: unknown";
+                lblMil.ForeColor = Color.Gray;
+                lblFreezeFrame.Text = "Freeze frame: unknown";
+                lblOdometer.Text = "Odometer: unknown";
+                lblCycle.Text = "";
+                lvDtcStatus.Items.Clear();
             }
         }
 
@@ -1248,21 +2084,28 @@ namespace OBD2EngineSimulator
         // BATCHED LOG DISPLAY
         // =====================================
 
-        private void LogFlushTimer_Tick(object sender, EventArgs e)
+        private void LogFlushTimer_Tick(object? sender, EventArgs e)
         {
+            UpdateHealthLabel();
+
+            // Every 2 s (20 ticks of 100 ms).
+            if (++faultResendTicks >= 20)
+            {
+                faultResendTicks = 0;
+
+                if (link.IsReady)
+                    ResendFaultStates();
+            }
+
             if (txtLog == null || txtLog.IsDisposed)
                 return;
 
             List<string> batch = new List<string>();
 
-            // Drain incoming messages in one UI update.
-
             while (batch.Count < 150 &&
-                   incomingLogMessages.TryDequeue(out string message))
+                   logQueue.TryDequeue(out string? message))
             {
-                batch.Add(
-                    DateTime.Now.ToString("HH:mm:ss.fff") +
-                    "  " + message);
+                batch.Add(message);
             }
 
             if (batch.Count > 0)
@@ -1271,9 +2114,6 @@ namespace OBD2EngineSimulator
 
         private void AppendLogBatch(List<string> lines)
         {
-            if (txtLog == null || txtLog.IsDisposed)
-                return;
-
             txtLog.AppendText(
                 string.Join(Environment.NewLine, lines) +
                 Environment.NewLine);
@@ -1294,17 +2134,12 @@ namespace OBD2EngineSimulator
             txtLog.ScrollToCaret();
         }
 
+        // All log output goes through the queue, so it is batched and trimmed.
         private void Log(string message)
         {
-            if (txtLog == null || txtLog.IsDisposed)
-                return;
-
-            string line =
+            logQueue.Enqueue(
                 DateTime.Now.ToString("HH:mm:ss.fff") +
-                "  " + message +
-                Environment.NewLine;
-
-            txtLog.AppendText(line);
+                "  " + message);
         }
 
         // =====================================
@@ -1314,31 +2149,15 @@ namespace OBD2EngineSimulator
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             StopSimulation();
-            DisconnectArduino();
 
-            if (startupTimer != null)
-            {
-                startupTimer.Stop();
-                startupTimer.Dispose();
-            }
+            simulationTimer.Stop();
+            simulationTimer.Dispose();
 
-            if (sendQueueTimer != null)
-            {
-                sendQueueTimer.Stop();
-                sendQueueTimer.Dispose();
-            }
+            logFlushTimer.Stop();
+            logFlushTimer.Dispose();
 
-            if (simulationTimer != null)
-            {
-                simulationTimer.Stop();
-                simulationTimer.Dispose();
-            }
-
-            if (logFlushTimer != null)
-            {
-                logFlushTimer.Stop();
-                logFlushTimer.Dispose();
-            }
+            link.Dispose();
+            toolTip.Dispose();
 
             base.OnFormClosing(e);
         }
