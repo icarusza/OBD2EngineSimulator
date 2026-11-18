@@ -51,7 +51,11 @@ namespace OBD2EngineSimulator
             Define("AMBIENT", "Ambient Air Temperature", "46", "°C", -40, 215, 20, 0, 1),
             Define("OIL", "Engine Oil Temperature", "5C", "°C", -40, 215, 90, 0, 1),
             Define("O2V", "O2 Sensor Voltage - B1S1", "24", "V", 0, 5, 0.45m, 3, 1000),
-            Define("FUELSYS", "Fuel System Status", "03", "code", 0, 16, 2, 0, 1)
+            Define("FUELSYS", "Fuel System Status", "03", "code", 0, 16, 2, 0, 1),
+            Define("STFT2", "Short-Term Fuel Trim - Bank 2", "08", "%", -100, 99.2m, 2.5m, 1, 10),
+            Define("LTFT2", "Long-Term Fuel Trim - Bank 2", "09", "%", -100, 99.2m, -1.8m, 1, 10),
+            Define("RAILP", "Fuel Rail Pressure (gauge)", "23", "kPa", 0, 60000, 5000, 0, 1),
+            Define("GEAR", "Transmission Gear (TCM)", "A4", "gear", 0, 8, 0, 0, 1)
         };
 
         public static ParameterInfo Get(string key) =>

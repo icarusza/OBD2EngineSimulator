@@ -78,6 +78,28 @@ namespace OBD2EngineSimulator
         private const string DefaultVin = "1M8GDM9AXKP042788";
         private const string DefaultCalibrationId = "OBDSIM-CAL-0001";
         private const string DefaultEcuName = "ECM-EngineControl";
+        private const string DefaultEsn = "OBDSIM-ENG-00001";
+
+        // Lifecycle view and fault injection (Diagnostics tab).
+        private ListView lvDtcStatus = null!;
+        private TextBox txtFaultCode = null!;
+        private ComboBox cmbFaultSeverity = null!;
+        private Label lblCycle = null!;
+
+        // Vehicle & ECU tab.
+        private TextBox txtEsn = null!;
+        private Label lblOdometer = null!;
+        private NumericUpDown numOdometer = null!;
+        private CheckBox chkTcm = null!;
+        private NumericUpDown numResponseDelay = null!;
+        private Label lblEcuSettingsStatus = null!;
+
+        // Fault states reported to the firmware (FAULT command): code -> 0/1/2.
+        // Active faults are re-sent every 2 s so a lost command cannot leave
+        // the firmware with a stale state.
+        private readonly Dictionary<string, int> faultStates = new Dictionary<string, int>();
+        private readonly HashSet<string> simulationFaults = new HashSet<string>();
+        private int faultResendTicks = 0;
 
         private readonly List<string>[] dtcCodes =
         {
@@ -203,9 +225,14 @@ namespace OBD2EngineSimulator
             link.RegisterItem("CAN", false, 0, false, CanProtocols[0].Mode.ToString(CultureInfo.InvariantCulture));
             link.RegisterItem("IGN", false, 0, false, "1");
             link.RegisterItem("LOG", false, 0, false, "1");
-            link.RegisterItem("VIN", false, 0, false, DefaultVin);
-            link.RegisterItem("CALID", false, 0, false, DefaultCalibrationId);
-            link.RegisterItem("ECUNAME", false, 0, false, DefaultEcuName);
+            link.RegisterItem("RESPDELAY", false, 0, false, "0");
+
+            // Stored in the Arduino's EEPROM: read on connect, sent only when edited.
+            link.RegisterItem("TCM", false, 0, true, "1");
+            link.RegisterItem("VIN", false, 0, true, DefaultVin);
+            link.RegisterItem("CALID", false, 0, true, DefaultCalibrationId);
+            link.RegisterItem("ECUNAME", false, 0, true, DefaultEcuName);
+            link.RegisterItem("ESN", false, 0, true, DefaultEsn);
 
             foreach (ParameterInfo info in ParameterDefinitions.All)
             {
@@ -450,7 +477,8 @@ namespace OBD2EngineSimulator
                 "Normal Tune",
                 "Lean Tune",
                 "Rich Tune",
-                "Bad Tune"
+                "Bad Tune",
+                "Severe Misfire"
             });
             cmbTuneMode.SelectedIndex = 0;
 
@@ -471,12 +499,13 @@ namespace OBD2EngineSimulator
             lblSimulation.Margin = new Padding(12, 8, 0, 0);
 
             chkAutoDtc = new CheckBox();
-            chkAutoDtc.Text = "Auto DTCs";
+            chkAutoDtc.Text = "Auto faults";
             chkAutoDtc.AutoSize = true;
             chkAutoDtc.Margin = new Padding(16, 7, 0, 0);
             toolTip.SetToolTip(chkAutoDtc,
-                "During simulation, fuel trims beyond ±20 % set P0171/P0172 (pending after 10 s, stored after 30 s). " +
-                "Bad tune also sets P0300.");
+                "During simulation, report faults to the ECU: fuel trims beyond ±20 % for 5 s (P0171/P0172), " +
+                "Bad Tune (P0300), Severe Misfire (P0302, flashing MIL). The ECU makes them pending, then " +
+                "confirmed after two drive cycles.");
 
             chkLinkDependent = new CheckBox();
             chkLinkDependent.Text = "Link MAF / load to RPM, MAP, IAT";
@@ -507,6 +536,7 @@ namespace OBD2EngineSimulator
 
             BuildParameterPages();
             BuildDiagnosticsPage();
+            BuildVehiclePage();
 
             if (tabParameters.TabPages.Count > 0)
             {
@@ -681,6 +711,15 @@ namespace OBD2EngineSimulator
                     if (updatingControls)
                         return;
 
+                    // Fuel system status allows only single-bit codes.
+                    decimal snapped = SnapToAllowed(key, numeric.Value);
+
+                    if (snapped != numeric.Value)
+                    {
+                        numeric.Value = snapped;  // raises ValueChanged again
+                        return;
+                    }
+
                     updatingControls = true;
                     slider.Value = (int)(numeric.Value * info.Scale);
                     valueLabel.Text = FormatValue(info, numeric.Value);
@@ -697,7 +736,8 @@ namespace OBD2EngineSimulator
                         return;
 
                     updatingControls = true;
-                    numeric.Value = (decimal)slider.Value / info.Scale;
+                    numeric.Value = SnapToAllowed(key, (decimal)slider.Value / info.Scale);
+                    slider.Value = (int)(numeric.Value * info.Scale);
                     valueLabel.Text = FormatValue(info, numeric.Value);
                     updatingControls = false;
 
@@ -709,6 +749,25 @@ namespace OBD2EngineSimulator
                 tabParameters.TabPages.Add(page);
                 cmbPID.Items.Add(info.Name);
             }
+        }
+
+        // FUELSYS (PID 03) must be 0 or a single bit: 1, 2, 4, 8, 16. Other
+        // values snap to the next code in the direction of the change, so the
+        // arrows and the slider step 1 -> 2 -> 4 -> 8 -> 16 and back.
+        private static readonly decimal[] FuelSystemCodes = { 0, 1, 2, 4, 8, 16 };
+        private decimal lastFuelSystem = 2;
+
+        private decimal SnapToAllowed(string key, decimal value)
+        {
+            if (key != "FUELSYS")
+                return value;
+
+            decimal snapped = value >= lastFuelSystem
+                ? FuelSystemCodes.Where(code => code >= value).DefaultIfEmpty(16).Min()
+                : FuelSystemCodes.Where(code => code <= value).DefaultIfEmpty(0).Max();
+
+            lastFuelSystem = snapped;
+            return snapped;
         }
 
         private string FormatValue(ParameterInfo info, decimal value)
@@ -731,18 +790,19 @@ namespace OBD2EngineSimulator
             layout.Dock = DockStyle.Fill;
             layout.Padding = new Padding(20);
             layout.ColumnCount = 3;
-            layout.RowCount = 7;
+            layout.RowCount = 8;
 
             for (int i = 0; i < 3; i++)
                 layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.3f));
 
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));   // MIL + freeze frame
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));   // list headers
-            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));   // lists
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 40));    // lists
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));   // add / remove
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));   // DTC sync status
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 70));   // identity fields
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));   // identity apply
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));   // lifecycle header
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 60));    // lifecycle table
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));   // faults + drive cycle
 
             page.Controls.Add(layout);
 
@@ -835,14 +895,133 @@ namespace OBD2EngineSimulator
             layout.Controls.Add(lblDtcStatus, 0, 4);
             layout.SetColumnSpan(lblDtcStatus, 3);
 
-            txtVin = AddIdentityField(layout, 0, "VIN (17 characters, Mode 09 / 02)", DefaultVin, 17);
-            txtCalId = AddIdentityField(layout, 1, "CALIBRATION ID (max 16, Mode 09 / 04)", DefaultCalibrationId, 16);
-            txtEcuName = AddIdentityField(layout, 2, "ECU NAME (max 20, Mode 09 / 0A)", DefaultEcuName, 20);
+            // DTC lifecycle as the ECU sees it (DTCX in the DTC? reply).
+            Label lifecycleHeader = new Label();
+            lifecycleHeader.Text = "DTC STATUS IN THE ECU (pending → confirmed after 2 failing drive cycles, " +
+                "MIL off after 3 passing cycles, erased after 40 warm-ups)";
+            lifecycleHeader.Font = new Font("Segoe UI", 8, FontStyle.Bold);
+            lifecycleHeader.ForeColor = Color.Gray;
+            lifecycleHeader.Dock = DockStyle.Fill;
+
+            layout.Controls.Add(lifecycleHeader, 0, 5);
+            layout.SetColumnSpan(lifecycleHeader, 3);
+
+            lvDtcStatus = new ListView();
+            lvDtcStatus.Dock = DockStyle.Fill;
+            lvDtcStatus.View = View.Details;
+            lvDtcStatus.FullRowSelect = true;
+            lvDtcStatus.Font = new Font("Consolas", 9);
+
+            foreach (string column in new[]
+            {
+                "Code", "ECU", "Status", "Fault now", "Pending", "Confirmed", "MIL",
+                "Permanent", "Failed cycles", "Passed cycles", "Warm-ups"
+            })
+            {
+                lvDtcStatus.Columns.Add(column, -2);
+            }
+
+            layout.Controls.Add(lvDtcStatus, 0, 6);
+            layout.SetColumnSpan(lvDtcStatus, 3);
+
+            FlowLayoutPanel faultPanel = new FlowLayoutPanel();
+            faultPanel.Dock = DockStyle.Fill;
+            faultPanel.WrapContents = false;
+
+            Label faultLabel = new Label();
+            faultLabel.Text = "FAULT:";
+            faultLabel.AutoSize = true;
+            faultLabel.Font = new Font("Segoe UI", 8, FontStyle.Bold);
+            faultLabel.ForeColor = Color.Gray;
+            faultLabel.Margin = new Padding(3, 8, 3, 0);
+
+            txtFaultCode = new TextBox();
+            txtFaultCode.Width = 90;
+            txtFaultCode.CharacterCasing = CharacterCasing.Upper;
+            txtFaultCode.MaxLength = 5;
+            txtFaultCode.PlaceholderText = "P0420";
+
+            cmbFaultSeverity = new ComboBox();
+            cmbFaultSeverity.DropDownStyle = ComboBoxStyle.DropDownList;
+            cmbFaultSeverity.Width = 170;
+            cmbFaultSeverity.Items.AddRange(new object[] { "Failing", "Severe (flashing MIL)" });
+            cmbFaultSeverity.SelectedIndex = 0;
+
+            Button btnFaultPresent = new Button();
+            btnFaultPresent.Text = "Fault present";
+            btnFaultPresent.AutoSize = true;
+            btnFaultPresent.Click += (sender, e) => ReportFaultFromInput(present: true);
+            toolTip.SetToolTip(btnFaultPresent,
+                "Report a failing test result: the ECU sets the DTC pending now and confirms it " +
+                "if it is still failing at the end of the next drive cycle.");
+
+            Button btnFaultGone = new Button();
+            btnFaultGone.Text = "Fault gone";
+            btnFaultGone.AutoSize = true;
+            btnFaultGone.Click += (sender, e) => ReportFaultFromInput(present: false);
+
+            Button btnEndCycle = new Button();
+            btnEndCycle.Text = "End drive cycle";
+            btnEndCycle.AutoSize = true;
+            btnEndCycle.Click += (sender, e) => EndDriveCycle();
+            toolTip.SetToolTip(btnEndCycle,
+                "Completes a drive cycle now (CYCLE:1). Turning the ignition off after the engine ran " +
+                "at least 60 s also completes one.");
+
+            lblCycle = new Label();
+            lblCycle.AutoSize = true;
+            lblCycle.Margin = new Padding(12, 8, 0, 0);
+            lblCycle.ForeColor = Color.DimGray;
+
+            faultPanel.Controls.Add(faultLabel);
+            faultPanel.Controls.Add(txtFaultCode);
+            faultPanel.Controls.Add(cmbFaultSeverity);
+            faultPanel.Controls.Add(btnFaultPresent);
+            faultPanel.Controls.Add(btnFaultGone);
+            faultPanel.Controls.Add(btnEndCycle);
+            faultPanel.Controls.Add(lblCycle);
+
+            layout.Controls.Add(faultPanel, 0, 7);
+            layout.SetColumnSpan(faultPanel, 3);
+
+            tabParameters.TabPages.Add(page);
+            cmbPID.Items.Add("Diagnostics (DTCs, MIL, faults, drive cycles)");
+        }
+
+        // =====================================
+        // VEHICLE & ECU PAGE
+        // =====================================
+
+        private void BuildVehiclePage()
+        {
+            TabPage page = new TabPage("Vehicle & ECU");
+            page.BackColor = Color.White;
+
+            TableLayoutPanel layout = new TableLayoutPanel();
+            layout.Dock = DockStyle.Fill;
+            layout.Padding = new Padding(20);
+            layout.ColumnCount = 4;
+            layout.RowCount = 6;
+
+            for (int i = 0; i < 4; i++)
+                layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25f));
+
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 70));   // identity fields
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));   // identity apply
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));   // odometer
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));   // TCM + response delay
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));   // factory reset
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+            page.Controls.Add(layout);
+
+            txtVin = AddIdentityField(layout, 0, 0, "VIN (17 characters, Mode 09 / 02)", DefaultVin, 17);
+            txtCalId = AddIdentityField(layout, 1, 0, "CALIBRATION ID (max 16, Mode 09 / 04)", DefaultCalibrationId, 16);
+            txtEcuName = AddIdentityField(layout, 2, 0, "ECU NAME (max 20, Mode 09 / 0A)", DefaultEcuName, 20);
+            txtEsn = AddIdentityField(layout, 3, 0, "ENGINE SERIAL (max 16, Mode 09 / 0D)", DefaultEsn, 16);
             txtVin.CharacterCasing = CharacterCasing.Upper;
 
-            FlowLayoutPanel identityPanel = new FlowLayoutPanel();
-            identityPanel.Dock = DockStyle.Fill;
-            identityPanel.WrapContents = false;
+            FlowLayoutPanel identityPanel = NewRowPanel();
 
             Button btnApplyIdentity = new Button();
             btnApplyIdentity.Text = "Apply vehicle information";
@@ -855,15 +1034,123 @@ namespace OBD2EngineSimulator
 
             identityPanel.Controls.Add(btnApplyIdentity);
             identityPanel.Controls.Add(lblIdentityStatus);
+            AddRow(layout, identityPanel, 1);
 
-            layout.Controls.Add(identityPanel, 0, 6);
-            layout.SetColumnSpan(identityPanel, 3);
+            // Odometer (PID A6): kept by the ECU, set on request.
+            FlowLayoutPanel odometerPanel = NewRowPanel();
+
+            lblOdometer = new Label();
+            lblOdometer.AutoSize = true;
+            lblOdometer.Font = new Font("Segoe UI", 10, FontStyle.Bold);
+            lblOdometer.Margin = new Padding(3, 7, 20, 0);
+            lblOdometer.Text = "Odometer: unknown";
+
+            numOdometer = new NumericUpDown();
+            numOdometer.Width = 120;
+            numOdometer.Maximum = 4294967;  // firmware keeps metres in 32 bits
+            numOdometer.DecimalPlaces = 1;
+            numOdometer.ThousandsSeparator = true;
+
+            Button btnSetOdometer = new Button();
+            btnSetOdometer.Text = "Set odometer (km)";
+            btnSetOdometer.AutoSize = true;
+            btnSetOdometer.Click += (sender, e) =>
+                link.SendCommand("ODO:" + numOdometer.Value.ToString("0.0", CultureInfo.InvariantCulture));
+
+            odometerPanel.Controls.Add(lblOdometer);
+            odometerPanel.Controls.Add(numOdometer);
+            odometerPanel.Controls.Add(btnSetOdometer);
+            AddRow(layout, odometerPanel, 2);
+
+            // ECU behaviour.
+            FlowLayoutPanel ecuPanel = NewRowPanel();
+
+            chkTcm = new CheckBox();
+            chkTcm.Text = "Transmission ECU (TCM) present";
+            chkTcm.AutoSize = true;
+            chkTcm.Checked = true;
+            chkTcm.Margin = new Padding(3, 7, 20, 0);
+            chkTcm.CheckedChanged += (sender, e) =>
+            {
+                if (!updatingControls)
+                    link.SetDesired("TCM", chkTcm.Checked ? "1" : "0");
+            };
+            toolTip.SetToolTip(chkTcm,
+                "A second ECU on 7E9 / 18DAF118 that also answers broadcast requests " +
+                "(speed, gear, its own DTCs, VIN). Stored in the Arduino's EEPROM.");
+
+            Label delayLabel = new Label();
+            delayLabel.Text = "Response delay (ms):";
+            delayLabel.AutoSize = true;
+            delayLabel.Margin = new Padding(3, 8, 3, 0);
+
+            numResponseDelay = new NumericUpDown();
+            numResponseDelay.Width = 80;
+            numResponseDelay.Maximum = 5000;
+            numResponseDelay.Increment = 10;
+            numResponseDelay.ValueChanged += (sender, e) =>
+                link.SetDesired("RESPDELAY", ((int)numResponseDelay.Value).ToString(CultureInfo.InvariantCulture));
+            toolTip.SetToolTip(numResponseDelay,
+                "Simulates a slow ECU. Above 40 ms the ECU first answers 'response pending' (7F xx 78), " +
+                "repeated every 4 s.");
+
+            lblEcuSettingsStatus = new Label();
+            lblEcuSettingsStatus.AutoSize = true;
+            lblEcuSettingsStatus.Margin = new Padding(12, 8, 0, 0);
+
+            ecuPanel.Controls.Add(chkTcm);
+            ecuPanel.Controls.Add(delayLabel);
+            ecuPanel.Controls.Add(numResponseDelay);
+            ecuPanel.Controls.Add(lblEcuSettingsStatus);
+            AddRow(layout, ecuPanel, 3);
+
+            FlowLayoutPanel resetPanel = NewRowPanel();
+
+            Button btnFactoryReset = new Button();
+            btnFactoryReset.Text = "Factory reset ECU memory…";
+            btnFactoryReset.AutoSize = true;
+            btnFactoryReset.Click += (sender, e) => FactoryReset();
+
+            resetPanel.Controls.Add(btnFactoryReset);
+            AddRow(layout, resetPanel, 4);
 
             tabParameters.TabPages.Add(page);
-            cmbPID.Items.Add("Diagnostics (DTCs, MIL, VIN)");
+            cmbPID.Items.Add("Vehicle & ECU (VIN, odometer, TCM)");
         }
 
-        private TextBox AddIdentityField(TableLayoutPanel layout, int column, string title, string value, int maxLength)
+        private static FlowLayoutPanel NewRowPanel()
+        {
+            FlowLayoutPanel panel = new FlowLayoutPanel();
+            panel.Dock = DockStyle.Fill;
+            panel.WrapContents = false;
+            return panel;
+        }
+
+        private static void AddRow(TableLayoutPanel layout, Control control, int row)
+        {
+            layout.Controls.Add(control, 0, row);
+            layout.SetColumnSpan(control, layout.ColumnCount);
+        }
+
+        private void FactoryReset()
+        {
+            if (!link.IsOpen)
+                return;
+
+            DialogResult answer = MessageBox.Show(
+                "Erase all DTCs, freeze frames, counters, the odometer and the vehicle information " +
+                "stored in the Arduino's EEPROM? This cannot be undone.",
+                "OBD-II Simulator", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+
+            if (answer != DialogResult.Yes)
+                return;
+
+            link.SendCommand("FACTORY:1");
+            engineModel.ResetFaultTimers();
+            Log("ECU memory reset to factory defaults.");
+        }
+
+        private TextBox AddIdentityField(TableLayoutPanel layout, int column, int row, string title, string value, int maxLength)
         {
             Panel field = new Panel();
             field.Dock = DockStyle.Fill;
@@ -885,7 +1172,7 @@ namespace OBD2EngineSimulator
             field.Controls.Add(textBox);
             field.Controls.Add(label);
 
-            layout.Controls.Add(field, column, 5);
+            layout.Controls.Add(field, column, row);
             return textBox;
         }
 
@@ -983,6 +1270,7 @@ namespace OBD2EngineSimulator
             string vin = txtVin.Text.Trim().ToUpperInvariant();
             string calId = txtCalId.Text.Trim();
             string ecuName = txtEcuName.Text.Trim();
+            string esn = txtEsn.Text.Trim();
 
             if (!Regex.IsMatch(vin, "^[A-HJ-NPR-Z0-9]{17}$"))
             {
@@ -991,16 +1279,17 @@ namespace OBD2EngineSimulator
                 return;
             }
 
-            if (!IsValidText(calId, 16) || !IsValidText(ecuName, 20))
+            if (!IsValidText(calId, 16) || !IsValidText(ecuName, 20) || !IsValidText(esn, 16))
             {
-                MessageBox.Show("Calibration ID (max 16) and ECU name (max 20) must be printable ASCII " +
-                    "without ; # | or =.", "OBD-II Simulator", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show("Calibration ID (max 16), ECU name (max 20) and engine serial (max 16) must be " +
+                    "printable ASCII without ; # | or =.", "OBD-II Simulator", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
 
             link.SetDesired("VIN", vin);
             link.SetDesired("CALID", calId);
             link.SetDesired("ECUNAME", ecuName);
+            link.SetDesired("ESN", esn);
             UpdateIdentityStatus();
         }
 
@@ -1037,6 +1326,9 @@ namespace OBD2EngineSimulator
             valueLabels[key].Text = FormatValue(info, value);
 
             updatingControls = false;
+
+            if (key == "FUELSYS")
+                lastFuelSystem = value;
 
             UpdateLambdaIfNeeded(key, value);
             SendParameter(key);
@@ -1121,6 +1413,7 @@ namespace OBD2EngineSimulator
                 1 => TuneMode.Lean,
                 2 => TuneMode.Rich,
                 3 => TuneMode.Bad,
+                4 => TuneMode.Misfire,
                 _ => TuneMode.Normal
             };
 
@@ -1189,7 +1482,68 @@ namespace OBD2EngineSimulator
             lblSimulation.Text = "SIMULATION STOPPED";
             lblSimulation.ForeColor = Color.Gray;
 
+            // Faults the simulation reported end with it.
+            foreach (string code in simulationFaults)
+                SetFault(code, 0);
+
+            simulationFaults.Clear();
+
             Log("Driving simulation stopped. Manual controls restored.");
+        }
+
+        // =====================================
+        // FAULTS AND DRIVE CYCLES
+        // =====================================
+
+        // Reports a live fault state to the firmware, which runs the DTC
+        // lifecycle (pending, confirmed after two drive cycles, MIL off after
+        // three passing cycles).
+        private void SetFault(string code, int severity, bool force = false)
+        {
+            faultStates.TryGetValue(code, out int current);
+
+            if (current == severity && !force)
+                return;
+
+            faultStates[code] = severity;
+            link.SendCommand("FAULT:" + code + ":" + severity.ToString(CultureInfo.InvariantCulture));
+            Log(severity == 0
+                ? "Fault " + code + " gone (passing test reported)."
+                : "Fault " + code + " present (severity " + severity + ").");
+        }
+
+        // Re-sends every known fault state, passed ones included, so a lost
+        // FAULT command (disconnect, Arduino restart) cannot leave the
+        // firmware with a stale state. The firmware only saves real changes.
+        private void ResendFaultStates()
+        {
+            foreach (KeyValuePair<string, int> fault in faultStates)
+                link.SendCommand("FAULT:" + fault.Key + ":" + fault.Value.ToString(CultureInfo.InvariantCulture));
+        }
+
+        private void ReportFaultFromInput(bool present)
+        {
+            string code = txtFaultCode.Text.Trim().ToUpperInvariant();
+
+            if (!IsValidDtc(code))
+            {
+                MessageBox.Show(
+                    "Enter a DTC like P0171 (P, C, B or U, then 0-3, then three hex digits).",
+                    "OBD-II Simulator", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            // Always sent, even if the app already thinks so.
+            SetFault(code, present ? cmbFaultSeverity.SelectedIndex + 1 : 0, force: true);
+        }
+
+        private void EndDriveCycle()
+        {
+            if (!link.IsOpen)
+                return;
+
+            link.SendCommand("CYCLE:1");
+            Log("Drive cycle ended (failing codes advance, passing codes count towards MIL off).");
         }
 
         private void SimulationTimer_Tick(object? sender, EventArgs e)
@@ -1210,16 +1564,10 @@ namespace OBD2EngineSimulator
             foreach (KeyValuePair<string, double> value in snapshot.Values)
                 SetParameterValue(value.Key, (decimal)value.Value);
 
-            foreach (string code in snapshot.PendingDtcs)
+            foreach (KeyValuePair<string, int> fault in snapshot.Faults)
             {
-                if (AddDtc(1, code))
-                    Log("Simulation set pending DTC " + code + ".");
-            }
-
-            foreach (string code in snapshot.StoredDtcs)
-            {
-                if (AddDtc(0, code))
-                    Log("Simulation set stored DTC " + code + " (MIL on).");
+                simulationFaults.Add(fault.Key);
+                SetFault(fault.Key, fault.Value);
             }
         }
 
@@ -1361,6 +1709,10 @@ namespace OBD2EngineSimulator
         {
             if (!isTraffic || chkTraffic.Checked)
                 Log(message);
+
+            // A scan tool cleared the DTCs: faults must be detected again.
+            if (message.Contains("EVENT DTC CLEARED BY TESTER", StringComparison.Ordinal))
+                engineModel.ResetFaultTimers();
         }
 
         private void Link_ItemChanged(LinkItem item)
@@ -1384,7 +1736,13 @@ namespace OBD2EngineSimulator
                 case "VIN":
                 case "CALID":
                 case "ECUNAME":
+                case "ESN":
                     UpdateIdentityStatus();
+                    break;
+
+                case "TCM":
+                case "RESPDELAY":
+                    UpdateEcuSettingsStatus();
                     break;
 
                 case "DTC_S":
@@ -1395,10 +1753,25 @@ namespace OBD2EngineSimulator
             }
         }
 
-        // The Arduino's DTC lists changed outside the app (e.g. Mode 04 from
-        // a scan tool): show what the ECU now has.
+        // A value stored on the Arduino differs from what the app showed
+        // (read on connect, DTC lifecycle, scan-tool clear): show the ECU's value.
         private void Link_ItemAdopted(LinkItem item)
         {
+            switch (item.Key)
+            {
+                case "VIN": txtVin.Text = item.Desired; return;
+                case "CALID": txtCalId.Text = item.Desired; return;
+                case "ECUNAME": txtEcuName.Text = item.Desired; return;
+                case "ESN": txtEsn.Text = item.Desired; return;
+
+                case "TCM":
+                    updatingControls = true;
+                    chkTcm.Checked = item.Desired == "1";
+                    updatingControls = false;
+                    UpdateEcuSettingsStatus();
+                    return;
+            }
+
             int index = Array.IndexOf(DtcKeys, item.Key);
 
             if (index < 0)
@@ -1408,10 +1781,6 @@ namespace OBD2EngineSimulator
             dtcCodes[index].AddRange(item.Desired.Split(',', StringSplitOptions.RemoveEmptyEntries));
             RefreshDtcListBox(index);
             UpdateDtcStatus();
-
-            // A cleared fault must be detected again from scratch, not re-set
-            // on the next simulation tick.
-            engineModel.ResetFaultTimers();
         }
 
         private void Link_DeviceStatus(string name, string value)
@@ -1434,9 +1803,22 @@ namespace OBD2EngineSimulator
                     break;
 
                 case "MIL":
-                    bool milOn = value == "1";
-                    lblMil.Text = milOn ? "MIL ON" : "MIL OFF";
-                    lblMil.ForeColor = milOn ? Color.DarkOrange : Color.FromArgb(35, 125, 75);
+                    lblMil.Text = value == "2" ? "MIL FLASHING" : value == "1" ? "MIL ON" : "MIL OFF";
+                    lblMil.ForeColor = value == "2" ? Color.Firebrick
+                        : value == "1" ? Color.DarkOrange
+                        : Color.FromArgb(35, 125, 75);
+                    break;
+
+                case "ODO":
+                    lblOdometer.Text = "Odometer: " + value + " km";
+                    break;
+
+                case "CYCLE":
+                    lblCycle.Text = "Drive cycles since Arduino start: " + value;
+                    break;
+
+                case "DTCX":
+                    ShowDtcLifecycle(value);
                     break;
 
                 case "FF":
@@ -1575,19 +1957,74 @@ namespace OBD2EngineSimulator
             LinkItem vin = link.GetItem("VIN");
             LinkItem calId = link.GetItem("CALID");
             LinkItem ecuName = link.GetItem("ECUNAME");
+            LinkItem esn = link.GetItem("ESN");
 
             lblIdentityStatus.Text =
                 "VIN " + StatusSymbol(vin) +
                 "   Calibration ID " + StatusSymbol(calId) +
-                "   ECU name " + StatusSymbol(ecuName);
+                "   ECU name " + StatusSymbol(ecuName) +
+                "   Engine serial " + StatusSymbol(esn);
 
             bool allConfirmed = vin.Status == ValueStatus.Confirmed &&
                 calId.Status == ValueStatus.Confirmed &&
-                ecuName.Status == ValueStatus.Confirmed;
+                ecuName.Status == ValueStatus.Confirmed &&
+                esn.Status == ValueStatus.Confirmed;
 
             lblIdentityStatus.ForeColor = allConfirmed
                 ? StatusColor(ValueStatus.Confirmed)
                 : Color.Gray;
+        }
+
+        private void UpdateEcuSettingsStatus()
+        {
+            if (!link.IsOpen)
+            {
+                lblEcuSettingsStatus.Text = "Not connected";
+                lblEcuSettingsStatus.ForeColor = Color.Gray;
+                return;
+            }
+
+            LinkItem tcm = link.GetItem("TCM");
+            LinkItem delay = link.GetItem("RESPDELAY");
+
+            lblEcuSettingsStatus.Text = "TCM " + StatusSymbol(tcm) + "   Response delay " + StatusSymbol(delay);
+            lblEcuSettingsStatus.ForeColor =
+                tcm.Status == ValueStatus.Confirmed && delay.Status == ValueStatus.Confirmed
+                    ? StatusColor(ValueStatus.Confirmed)
+                    : Color.Gray;
+        }
+
+        // DTCX=<code>:<status hex>:<failed cycles>:<passed cycles>:<warm-ups>:<permanent>:<E|T>,...
+        private void ShowDtcLifecycle(string value)
+        {
+            lvDtcStatus.BeginUpdate();
+            lvDtcStatus.Items.Clear();
+
+            foreach (string entry in value.Split(',', StringSplitOptions.RemoveEmptyEntries))
+            {
+                string[] fields = entry.Split(':');
+
+                if (fields.Length != 7 ||
+                    !int.TryParse(fields[1], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out int status))
+                    continue;
+
+                string Flag(int bit) => (status & bit) != 0 ? "yes" : "";
+
+                ListViewItem row = new ListViewItem(fields[0]);
+                row.SubItems.Add(fields[6] == "T" ? "TCM" : "ECM");
+                row.SubItems.Add(fields[1]);
+                row.SubItems.Add(Flag(0x01));
+                row.SubItems.Add(Flag(0x04));
+                row.SubItems.Add(Flag(0x08));
+                row.SubItems.Add(Flag(0x80));
+                row.SubItems.Add(fields[5] == "1" ? "yes" : "");
+                row.SubItems.Add(fields[2]);
+                row.SubItems.Add(fields[3]);
+                row.SubItems.Add(fields[4]);
+                lvDtcStatus.Items.Add(row);
+            }
+
+            lvDtcStatus.EndUpdate();
         }
 
         private void UpdateHealthLabel()
@@ -1629,6 +2066,7 @@ namespace OBD2EngineSimulator
             UpdateIgnitionLabel();
             UpdateDtcStatus();
             UpdateIdentityStatus();
+            UpdateEcuSettingsStatus();
             UpdateHealthLabel();
 
             if (!link.IsOpen)
@@ -1636,6 +2074,9 @@ namespace OBD2EngineSimulator
                 lblMil.Text = "MIL: unknown";
                 lblMil.ForeColor = Color.Gray;
                 lblFreezeFrame.Text = "Freeze frame: unknown";
+                lblOdometer.Text = "Odometer: unknown";
+                lblCycle.Text = "";
+                lvDtcStatus.Items.Clear();
             }
         }
 
@@ -1646,6 +2087,15 @@ namespace OBD2EngineSimulator
         private void LogFlushTimer_Tick(object? sender, EventArgs e)
         {
             UpdateHealthLabel();
+
+            // Every 2 s (20 ticks of 100 ms).
+            if (++faultResendTicks >= 20)
+            {
+                faultResendTicks = 0;
+
+                if (link.IsReady)
+                    ResendFaultStates();
+            }
 
             if (txtLog == null || txtLog.IsDisposed)
                 return;

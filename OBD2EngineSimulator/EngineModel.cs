@@ -8,7 +8,8 @@ namespace OBD2EngineSimulator
         Normal,
         Lean,
         Rich,
-        Bad
+        Bad,
+        Misfire
     }
 
     // Fuel system status codes (PID 03).
@@ -24,8 +25,10 @@ namespace OBD2EngineSimulator
     public sealed class EngineSnapshot
     {
         public Dictionary<string, double> Values { get; } = new Dictionary<string, double>();
-        public List<string> PendingDtcs { get; } = new List<string>();
-        public List<string> StoredDtcs { get; } = new List<string>();
+
+        // Fault code -> 0 passed, 1 failed, 2 severe (flashing MIL). Only
+        // filled when auto faults are enabled.
+        public Dictionary<string, int> Faults { get; } = new Dictionary<string, int>();
     }
 
     // 60-second drive cycle with values that depend on each other:
@@ -65,11 +68,14 @@ namespace OBD2EngineSimulator
             ResetFaultTimers();
         }
 
+        // After DTCs are cleared, faults must be detected again from scratch.
         public void ResetFaultTimers()
         {
             leanSeconds = 0;
             richSeconds = 0;
             badTuneSeconds = 0;
+            leanActive = false;
+            richActive = false;
         }
 
         // =====================================
@@ -269,6 +275,22 @@ namespace OBD2EngineSimulator
 
             double battery = rpm >= 300 ? 14.2 + 0.05 * Math.Sin(t * 3) : 12.4;
 
+            // Severe misfire: one cylinder misses, the engine runs rough and the
+            // unburnt oxygen makes the O2 sensor read lean.
+            if (mode == TuneMode.Misfire && !overrun)
+            {
+                rpm += 35 * Math.Sin(t * 9);
+                measuredAfr = Math.Min(20, measuredAfr + 1.2);
+                o2Voltage = Math.Max(0.02, o2Voltage - 0.25);
+            }
+
+            // Bank 2 runs slightly richer than bank 1.
+            double stft2 = fuelSystem == FuelSystemStatus.ClosedLoop ? stft - 0.6 + Math.Sin(t * 0.9) : 0;
+            double ltft2 = ltft + 0.8;
+
+            // Direct injection: rail pressure rises with load (4 to 15 MPa).
+            double railPressure = rpm >= 300 ? 4000 + load * 110 : 0;
+
             EngineSnapshot snapshot = new EngineSnapshot();
             Dictionary<string, double> v = snapshot.Values;
 
@@ -292,43 +314,76 @@ namespace OBD2EngineSimulator
             v["OIL"] = oil;
             v["O2V"] = o2Voltage;
             v["FUELSYS"] = fuelSystem;
+            v["STFT2"] = Math.Max(-100, Math.Min(99.2, stft2));
+            v["LTFT2"] = Math.Max(-100, Math.Min(99.2, ltft2));
+            v["RAILP"] = railPressure;
+            v["GEAR"] = GearForSpeed(speed);
 
             if (autoDtcs)
-                UpdateFaultCodes(snapshot, dt, mode, stft + ltft, fuelSystem);
+                UpdateFaults(snapshot, dt, mode, stft + ltft, fuelSystem);
 
             return snapshot;
         }
 
-        // =====================================
-        // AUTOMATIC FAULT CODES
-        // =====================================
-        // Total trim beyond ±20 % for 10 s sets a pending code, 30 s a stored
-        // (confirmed) code. Bad tune also sets a random misfire code.
-
-        private static void Escalate(EngineSnapshot snapshot, double seconds, string code)
+        private static int GearForSpeed(double speedKmh)
         {
-            if (seconds >= 10)
-                snapshot.PendingDtcs.Add(code);
+            double[] upshiftAt = { 0.5, 15, 30, 50, 70, 95, 125 };
+            int gear = 0;
 
-            if (seconds >= 30)
-                snapshot.StoredDtcs.Add(code);
-        }
-
-        private void UpdateFaultCodes(EngineSnapshot snapshot, double dt, TuneMode mode, double totalTrim, int fuelSystem)
-        {
-            // Trim monitoring only runs in closed loop; open-loop phases
-            // (wide-open throttle, overrun) pause it without resetting.
-            if (fuelSystem == FuelSystemStatus.ClosedLoop)
+            foreach (double threshold in upshiftAt)
             {
-                leanSeconds = totalTrim > 20 ? leanSeconds + dt : 0;
-                richSeconds = totalTrim < -20 ? richSeconds + dt : 0;
+                if (speedKmh >= threshold)
+                    gear++;
             }
 
-            badTuneSeconds = mode == TuneMode.Bad ? badTuneSeconds + dt : 0;
+            return gear;
+        }
 
-            Escalate(snapshot, leanSeconds, "P0171");
-            Escalate(snapshot, richSeconds, "P0172");
-            Escalate(snapshot, badTuneSeconds, "P0300");
+        // =====================================
+        // AUTOMATIC FAULTS
+        // =====================================
+        // The model only reports whether a fault is present (FAULT command);
+        // the firmware turns that into pending/confirmed DTCs over drive
+        // cycles, like a real ECU.
+        //   P0171 / P0172: total fuel trim beyond +/-20 % for 5 s in closed loop
+        //                  (cleared after 5 s back within limits).
+        //   P0300: random misfire (Bad Tune), severity 1.
+        //   P0302: cylinder 2 misfire (Misfire), severity 2 = flashing MIL.
+
+        public const double FaultDebounceSeconds = 5;
+
+        private bool leanActive;
+        private bool richActive;
+
+        private static bool Debounce(bool condition, bool active, ref double seconds, double dt)
+        {
+            seconds = condition != active ? seconds + dt : 0;
+
+            if (seconds >= FaultDebounceSeconds)
+            {
+                seconds = 0;
+                return condition;
+            }
+
+            return active;
+        }
+
+        private void UpdateFaults(EngineSnapshot snapshot, double dt, TuneMode mode, double totalTrim, int fuelSystem)
+        {
+            // Trim monitoring only runs in closed loop; open-loop phases
+            // (wide-open throttle, overrun) pause it.
+            if (fuelSystem == FuelSystemStatus.ClosedLoop)
+            {
+                leanActive = Debounce(totalTrim > 20, leanActive, ref leanSeconds, dt);
+                richActive = Debounce(totalTrim < -20, richActive, ref richSeconds, dt);
+            }
+
+            badTuneSeconds += dt;
+
+            snapshot.Faults["P0171"] = leanActive ? 1 : 0;
+            snapshot.Faults["P0172"] = richActive ? 1 : 0;
+            snapshot.Faults["P0300"] = mode == TuneMode.Bad && badTuneSeconds >= FaultDebounceSeconds ? 1 : 0;
+            snapshot.Faults["P0302"] = mode == TuneMode.Misfire && badTuneSeconds >= FaultDebounceSeconds ? 2 : 0;
         }
     }
 }

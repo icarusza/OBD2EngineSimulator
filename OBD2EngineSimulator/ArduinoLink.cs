@@ -21,12 +21,12 @@ namespace OBD2EngineSimulator
     // One value or setting kept in sync with the Arduino.
     public sealed class LinkItem
     {
-        internal LinkItem(string key, bool isNumeric, decimal tolerance, bool adoptReadBack, string desired)
+        internal LinkItem(string key, bool isNumeric, decimal tolerance, bool deviceOwned, string desired)
         {
             Key = key;
             IsNumeric = isNumeric;
             Tolerance = tolerance;
-            AdoptReadBack = adoptReadBack;
+            DeviceOwned = deviceOwned;
             Desired = desired;
         }
 
@@ -34,9 +34,12 @@ namespace OBD2EngineSimulator
         public bool IsNumeric { get; }
         public decimal Tolerance { get; }
 
-        // When a read-back differs, take the Arduino's value instead of
-        // resending ours (used for DTC lists, which a scan tool can clear).
-        public bool AdoptReadBack { get; }
+        // Stored on the Arduino (EEPROM): DTC lists, vehicle information, TCM.
+        // On connect and on read-back the app takes the Arduino's value
+        // instead of sending its own; only user edits are sent. Otherwise
+        // connecting would overwrite persisted DTCs, and a scan tool's clear
+        // would be undone.
+        public bool DeviceOwned { get; }
 
         public string Desired { get; internal set; }
         public string? Confirmed { get; internal set; }
@@ -142,11 +145,13 @@ namespace OBD2EngineSimulator
         // ITEMS
         // =====================================
 
-        public void RegisterItem(string key, bool isNumeric, decimal tolerance, bool adoptReadBack, string initialValue)
+        public void RegisterItem(string key, bool isNumeric, decimal tolerance, bool deviceOwned, string initialValue)
         {
-            items[key] = new LinkItem(key, isNumeric, tolerance, adoptReadBack, Normalize(key, initialValue));
+            items[key] = new LinkItem(key, isNumeric, tolerance, deviceOwned, Normalize(key, initialValue));
             itemOrder.Add(key);
-            dirty.Add(key);
+
+            if (!deviceOwned)
+                dirty.Add(key);
         }
 
         public void SetParameter(string key, decimal value)
@@ -198,6 +203,8 @@ namespace OBD2EngineSimulator
             return string.Equals(Normalize(item.Key, value), item.Desired, StringComparison.Ordinal);
         }
 
+        // Queues every app-owned item for sending; device-owned items wait for
+        // the read-back that adopts the Arduino's stored value.
         private void MarkAllDirty()
         {
             foreach (string key in itemOrder)
@@ -207,7 +214,12 @@ namespace OBD2EngineSimulator
                 item.FailureReason = null;
                 item.Attempts = 0;
                 item.Rejected = false;
-                dirty.Add(key);
+
+                if (item.DeviceOwned)
+                    dirty.Remove(key);
+                else
+                    dirty.Add(key);
+
                 ItemChanged?.Invoke(item);
             }
         }
@@ -424,12 +436,17 @@ namespace OBD2EngineSimulator
             SetState(LinkState.Ready);
             lastReadBackMs = clock.ElapsedMilliseconds;
             MarkAllDirty();
-            Log("Arduino link ready. Sending all settings and values.");
+
+            // Read the Arduino's stored DTCs and vehicle information first.
+            QueueQuery("INFO");
+            QueueQuery("DTC?");
+
+            Log("Arduino link ready. Reading stored DTCs and vehicle information, sending settings and values.");
         }
 
         private void Resync(string reason)
         {
-            Log("Arduino restart detected (" + reason + "). Restoring all settings, DTCs and values.");
+            Log("Arduino restart detected (" + reason + "). Restoring settings and values; DTCs and vehicle information come from its EEPROM.");
             inFlight.Clear();
             ClearExpired();
             pendingQueries.Clear();
@@ -437,6 +454,7 @@ namespace OBD2EngineSimulator
             lastUptimeMs = null;
             MarkAllDirty();
             QueueQuery("INFO");
+            QueueQuery("DTC?");
         }
 
         // =====================================
@@ -828,6 +846,19 @@ namespace OBD2EngineSimulator
             DeviceStatus?.Invoke(name, value);
         }
 
+        // Takes the Arduino's value for a device-owned item.
+        private void Adopt(LinkItem item, string value)
+        {
+            bool changed = item.Desired != value;
+
+            item.Desired = value;
+            item.Status = ValueStatus.Confirmed;
+            item.FailureReason = null;
+
+            if (changed)
+                ItemAdopted?.Invoke(item);
+        }
+
         private void ApplyConfirmed(LinkItem item, string value, bool readBack)
         {
             value = Normalize(item.Key, value);
@@ -851,13 +882,12 @@ namespace OBD2EngineSimulator
                         item.FailureReason = null;
                     }
                 }
-                else if (item.AdoptReadBack && !item.Rejected)
+                else if (item.DeviceOwned)
                 {
-                    item.Desired = value;
-                    item.Status = ValueStatus.Confirmed;
-                    item.FailureReason = null;
-                    Log(item.Key + " changed on the Arduino (e.g. cleared by a scan tool): now '" + value + "'.");
-                    ItemAdopted?.Invoke(item);
+                    // The Arduino's stored value wins, even after a rejected
+                    // edit (it may have applied part of it).
+                    item.Rejected = false;
+                    Adopt(item, value);
                 }
                 else if (item.Status != ValueStatus.Clamped && !item.Rejected)
                 {
@@ -879,6 +909,11 @@ namespace OBD2EngineSimulator
                 else if (item.Rejected && !matches)
                 {
                     // Rejected by an ERR in the same line: stay Failed.
+                }
+                else if (!matches && item.DeviceOwned)
+                {
+                    // The Arduino changed it itself (e.g. a FAULT made a DTC pending).
+                    Adopt(item, value);
                 }
                 else if (matches)
                 {
